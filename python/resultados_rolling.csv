@@ -1,0 +1,5 @@
+,MAE,MAPE (%)
+Ingênuo,58.0,65.3
+Média móvel (8 sem.),50.52,70.0
+"SES – ETS(A,N,N)",48.07,63.52
+Holt amortecido,46.84,62.58

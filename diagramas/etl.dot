@@ -1,0 +1,20 @@
+digraph etl {
+  graph [rankdir=TB, bgcolor="white", dpi=300, fontname="Helvetica", nodesep=0.3, ranksep=0.28, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=9.5, color="#52514e", fillcolor="#f4f3ef", width=3.3];
+  edge  [color="#52514e", fontname="Helvetica", fontsize=8.5, fontcolor="#52514e"];
+
+  a [label="1. fn_iniciar_carga(unidade, arquivo)\nverifica usuário autenticado · abre log_carga"];
+  b [label="2. fn_enviar_lote(id_carga, linhas JSON)\nRN-02 valida layout (5 colunas) · grava stg_exame (texto bruto)"];
+  c [label="3. Validação linha a linha (staging)\nRN-01 data serial Excel · data futura · exame com código\nsexo e faixa no domínio · atendimento preenchido"];
+  d [shape=diamond, style="filled", fillcolor="white", width=2.2, label="RN-03\ninválidas > 5%?"];
+  r [label="Carga REJEITADA\nlog com tipos de erro · staging apagada", fillcolor="#fbe3d8", color="#eb6834"];
+  e [label="4. Dimensões\nnovas datas (dim_tempo) · novos exames (RN-07 a RN-10)\nnovos tipos de atendimento"];
+  f [label="5. RN-11 Substituição do período\nDELETE fato da unidade entre data mín. e máx. do arquivo\nINSERT das linhas válidas (sem deduplicação)", fillcolor="#e9f1fb", color="#2a78d6"];
+  g [label="6. log_carga = concluída · staging apagada (LGPD, minimização)"];
+  h [label="7. fn_pos_carga(unidade)\nprevisão SES com intervalo de 95% (RN-12/13)\nperfis de demanda por K-means (RN-14/15)\ninsights: manter, atualizar ou encerrar (RN-16 a RN-23)"];
+
+  a -> b -> c -> d;
+  d -> r [label="sim"];
+  d -> e [label="não"];
+  e -> f -> g -> h;
+}

@@ -1,0 +1,42 @@
+digraph arq {
+  graph [rankdir=TB, bgcolor="white", dpi=300, fontname="Helvetica", nodesep=0.3, ranksep=0.35, pad=0.15, splines=ortho, newrank=true];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, color="#52514e", fillcolor="#f4f3ef", penwidth=1.1, width=2.3];
+  edge  [color="#52514e", fontname="Helvetica", fontsize=8.5, fontcolor="#52514e", penwidth=1.1];
+
+  esus [label="e-SUS APS (PEC da UBS)\nrelatório gerencial de exames", fillcolor="white"];
+  arq  [label="Arquivo .xlsb / .xlsx", shape=note, fillcolor="white", width=1.8];
+
+  subgraph cluster_front {
+    label="FRONTEND  (Lovable · React + TypeScript)"; fontsize=9; fontcolor="#2a78d6"; color="#2a78d6"; style="rounded,dashed";
+    login [label="Login\n(e-mail + senha)"];
+    up    [label="Carga de dados\nleitura com SheetJS\nlotes de 5.000 linhas"];
+    dash  [label="Painel\nKPIs · séries · pirâmide\ncategorias · previsão"];
+  }
+
+  subgraph cluster_back {
+    label="BACKEND  (Lovable Cloud · PostgreSQL)"; fontsize=9; fontcolor="#eb6834"; color="#eb6834"; style="rounded,dashed";
+    auth [label="Autenticação (JWT)\ncadastro público desativado"];
+    etl  [label="ETL em PL/pgSQL\nstaging → validação →\ndimensões → fato"];
+    sem  [label="Camada semântica\nfn_dashboard() · 10 medidas\nresumo executivo + insights"];
+    dw   [label="Modelo estrela\nfato_exame + 6 dimensões\nRLS: somente autenticados", fillcolor="#e9f1fb", color="#2a78d6"];
+    ml   [label="Modelos de ML\nprevisão: SES / ETS(A,N,N)\nperfis: K-means\nretreino a cada carga"];
+  }
+  py [label="Python (Jupyter)\nauditoria · EDA ·\nseleção dos modelos", fillcolor="white", style="rounded,dashed"];
+
+  { rank=same; esus; arq; }
+  { rank=same; login; up; dash; }
+  { rank=same; auth; etl; sem; }
+  { rank=same; dw; py; }
+
+  esus -> arq;
+  arq -> up;
+  login -> auth [dir=both];
+  up -> etl;
+  etl -> dw;
+  dw -> sem;
+  sem -> dash [xlabel="JSON "];
+  dw -> ml; ml -> dw [style=dashed];
+  py -> ml [style=dashed];
+  login -> up -> dash [style=invis];
+  auth -> etl -> sem [style=invis];
+}

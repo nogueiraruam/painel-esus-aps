@@ -1,0 +1,422 @@
+Aplique a migração SQL abaixo no banco do Lovable Cloud EXATAMENTE como está escrita, sem alterar nomes, tipos, políticas ou funções, e sem criar ou alterar telas. Ela é uma ATUALIZAÇÃO das 5 migrações já aplicadas (arquivo 07_atualizacao_perfis.sql): cria as tabelas e funções de perfis de demanda (K-means), atualiza a função fn_finalizar_carga para recalcular previsão e perfis ao final de cada carga e gera os perfis para os dados que já estiverem carregados. Depois de aplicar, apenas confirme que foi executada sem erros.
+
+```sql
+-- =====================================================================
+-- 07_atualizacao_perfis.sql  (ATUALIZAÇÃO INCREMENTAL)
+-- Para bancos que já receberam as migrações 01 a 05.
+--   Parte A: cria os perfis de demanda (K-means) = conteúdo de 06_perfis.sql
+--   Parte B: atualiza fn_finalizar_carga para chamar fn_pos_carga
+--            (previsão + perfis) ao final de cada carga
+--   Parte C: gera os perfis para os dados já carregados (se houver)
+-- Pode ser executado mais de uma vez sem efeito colateral.
+-- =====================================================================
+
+-- ======================= PARTE A =======================
+-- =====================================================================
+-- 06_perfis.sql
+-- Perfis de demanda: agrupamento NÃO SUPERVISIONADO (K-means).
+--
+-- Como a exportação do e-SUS não identifica pacientes, a unidade de análise
+-- é o PERFIL DEMOGRÁFICO = combinação de sexo × faixa etária (até 63 perfis).
+-- Cada perfil é descrito pela COMPOSIÇÃO dos exames que solicita: o vetor
+-- de proporções das categorias temáticas (soma = 1). Perfis com composição
+-- parecida caem no mesmo grupo.
+--
+--   RN-14 | Só entram no agrupamento perfis com pelo menos 30 exames.
+--   RN-15 | k é escolhido entre 2 e 6 pelo maior coeficiente de silhueta.
+--   Inicialização determinística (reprodutível): 1º centróide = perfil de
+--   maior volume; os demais = perfil mais distante dos centróides já
+--   escolhidos (farthest-first). Atualização pelo algoritmo de Lloyd.
+--   O agrupamento é refeito automaticamente a cada carga concluída.
+-- =====================================================================
+
+create table if not exists public.perfil_demanda (
+  id_unidade  integer  not null references public.dim_unidade,
+  id_sexo     smallint not null references public.dim_sexo,
+  id_faixa    smallint not null references public.dim_faixa_etaria,
+  n_exames    integer  not null,
+  grupo       smallint,                 -- null = não agrupado (RN-14)
+  silhueta    numeric(6,3),             -- silhueta individual do perfil
+  composicao  jsonb    not null,        -- {categoria: proporção}
+  gerado_em   timestamptz not null default now(),
+  primary key (id_unidade, id_sexo, id_faixa)
+);
+
+create table if not exists public.perfil_grupo (
+  id_unidade   integer  not null references public.dim_unidade,
+  grupo        smallint not null,       -- 1 = grupo com mais exames
+  k            smallint not null,
+  silhueta_k   numeric(6,3) not null,   -- silhueta média da solução escolhida
+  n_perfis     integer  not null,
+  n_exames     integer  not null,
+  destaque     text     not null,       -- categoria mais acima da média geral
+  destaque_pp  numeric(6,1) not null,   -- diferença em pontos percentuais
+  composicao   jsonb    not null,       -- centróide {categoria: %}
+  membros      text     not null,       -- lista legível dos perfis
+  gerado_em    timestamptz not null default now(),
+  primary key (id_unidade, grupo)
+);
+
+alter table public.perfil_demanda enable row level security;
+alter table public.perfil_grupo   enable row level security;
+revoke all on public.perfil_demanda, public.perfil_grupo from anon, authenticated;
+grant select on public.perfil_demanda, public.perfil_grupo to authenticated;
+drop policy if exists leitura_autenticada on public.perfil_demanda;
+drop policy if exists leitura_autenticada on public.perfil_grupo;
+create policy leitura_autenticada on public.perfil_demanda for select to authenticated using (auth.uid() is not null);
+create policy leitura_autenticada on public.perfil_grupo   for select to authenticated using (auth.uid() is not null);
+
+-- ---------------------------------------------------------------------
+create or replace function public.fn_gerar_perfis(p_id_unidade integer, p_min_exames integer default 30)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  cats     text[];                -- categorias (dimensões do vetor)
+  D        integer;
+  ids_s    smallint[]; ids_f smallint[]; vol integer[];
+  mx       float8[];              -- matriz n × D armazenada em vetor (linha a linha)
+  n        integer;
+  k        integer; best_k integer; best_sil float8 := -2;
+  cent     float8[]; lab integer[]; best_lab integer[]; best_cent float8[];
+  sil_i    float8[]; best_sil_i float8[];
+  i integer; j integer; c integer; it integer; mudou boolean;
+  dist float8; dmin float8; arg integer; s float8;
+  a float8; b float8; cnt integer; acc float8; sil float8;
+  geral float8[];
+begin
+  delete from perfil_demanda where id_unidade = p_id_unidade;
+  delete from perfil_grupo   where id_unidade = p_id_unidade;
+
+  select array_agg(categoria order by categoria) into cats from (select distinct categoria from dim_exame) z;
+  D := array_length(cats, 1);
+
+  -- 1) Vetores de composição de cada perfil (proporção por categoria)
+  insert into perfil_demanda (id_unidade, id_sexo, id_faixa, n_exames, composicao)
+  select p_id_unidade, f.id_sexo, f.id_faixa, count(*), '{}'::jsonb
+    from fato_exame f
+   where f.id_unidade = p_id_unidade
+   group by f.id_sexo, f.id_faixa;
+
+  -- composição: proporção de cada categoria no total de exames do perfil
+  update perfil_demanda p
+     set composicao = (select jsonb_object_agg(c2.categoria,
+                              round(coalesce((select count(*) from fato_exame f2 join dim_exame e using (id_exame)
+                                               where f2.id_unidade = p.id_unidade and f2.id_sexo = p.id_sexo
+                                                 and f2.id_faixa = p.id_faixa and e.categoria = c2.categoria),0)::numeric
+                                    / p.n_exames, 6))
+                         from unnest(cats) c2(categoria))
+   where p.id_unidade = p_id_unidade;
+
+  -- 2) Matriz mx com os perfis elegíveis (RN-14)
+  select array_agg(id_sexo order by id_sexo, id_faixa), array_agg(id_faixa order by id_sexo, id_faixa),
+         array_agg(n_exames order by id_sexo, id_faixa)
+    into ids_s, ids_f, vol
+    from perfil_demanda where id_unidade = p_id_unidade and n_exames >= p_min_exames;
+  n := coalesce(array_length(vol, 1), 0);
+  if n < 4 then
+    return jsonb_build_object('status','sem_agrupamento','motivo','menos de 4 perfis elegíveis','perfis',n);
+  end if;
+
+  mx := array_fill(0::float8, array[n * D]);
+  for i in 1..n loop
+    for j in 1..D loop
+      mx[(i-1)*D + j] := (select (composicao ->> cats[j])::float8
+                            from perfil_demanda where id_unidade = p_id_unidade and id_sexo = ids_s[i] and id_faixa = ids_f[i]);
+    end loop;
+  end loop;
+
+  -- 3) K-means para k = 2..6 e escolha pela silhueta (RN-15)
+  for k in 2..least(6, n - 1) loop
+    -- inicialização farthest-first
+    cent := array_fill(0::float8, array[k * D]);
+    arg := 1;
+    for i in 2..n loop if vol[i] > vol[arg] then arg := i; end if; end loop;
+    for j in 1..D loop cent[j] := mx[(arg-1)*D + j]; end loop;
+    for c in 2..k loop
+      s := -1; arg := 1;
+      for i in 1..n loop
+        dmin := 'infinity';
+        for c2 in 1..c-1 loop
+          dist := 0;
+          for j in 1..D loop dist := dist + (mx[(i-1)*D+j] - cent[(c2-1)*D+j])^2; end loop;
+          dmin := least(dmin, dist);
+        end loop;
+        if dmin > s then s := dmin; arg := i; end if;
+      end loop;
+      for j in 1..D loop cent[(c-1)*D + j] := mx[(arg-1)*D + j]; end loop;
+    end loop;
+
+    -- iterações de Lloyd
+    lab := array_fill(0, array[n]);
+    for it in 1..100 loop
+      mudou := false;
+      for i in 1..n loop                         -- passo de atribuição
+        dmin := 'infinity'; arg := 1;
+        for c in 1..k loop
+          dist := 0;
+          for j in 1..D loop dist := dist + (mx[(i-1)*D+j] - cent[(c-1)*D+j])^2; end loop;
+          if dist < dmin then dmin := dist; arg := c; end if;
+        end loop;
+        if lab[i] <> arg then lab[i] := arg; mudou := true; end if;
+      end loop;
+      exit when not mudou;
+      for c in 1..k loop                         -- passo de atualização (média)
+        cnt := 0;
+        for i in 1..n loop if lab[i] = c then cnt := cnt + 1; end if; end loop;
+        if cnt > 0 then
+          for j in 1..D loop
+            acc := 0;
+            for i in 1..n loop if lab[i] = c then acc := acc + mx[(i-1)*D+j]; end if; end loop;
+            cent[(c-1)*D+j] := acc / cnt;
+          end loop;
+        end if;
+      end loop;
+    end loop;
+
+    -- silhueta média (distância euclidiana); grupo unitário => s(i) = 0
+    sil := 0; sil_i := array_fill(0::float8, array[n]);
+    for i in 1..n loop
+      a := 0; cnt := 0; b := 'infinity';
+      for c in 1..k loop
+        acc := 0; it := 0;
+        for i2 in 1..n loop
+          if lab[i2] = c and i2 <> i then
+            dist := 0;
+            for j in 1..D loop dist := dist + (mx[(i-1)*D+j] - mx[(i2-1)*D+j])^2; end loop;
+            acc := acc + sqrt(dist); it := it + 1;
+          end if;
+        end loop;
+        if c = lab[i] then a := case when it > 0 then acc / it end; cnt := it;
+        elsif it > 0 then b := least(b, acc / it);
+        end if;
+      end loop;
+      sil_i[i] := case when cnt = 0 then 0 else (b - a) / greatest(a, b) end;
+      sil := sil + sil_i[i];
+    end loop;
+    sil := sil / n;
+    if sil > best_sil then best_sil := sil; best_k := k; best_lab := lab; best_cent := cent; best_sil_i := sil_i; end if;
+  end loop;
+
+  -- 4) Gravação: grupos renumerados por volume de exames (1 = maior)
+  for i in 1..n loop
+    update perfil_demanda set grupo = best_lab[i], silhueta = round(best_sil_i[i]::numeric, 3)
+     where id_unidade = p_id_unidade and id_sexo = ids_s[i] and id_faixa = ids_f[i];
+  end loop;
+
+  select array_agg(coalesce(x.n,0)::float8 / t.tot order by c2.categoria) into geral
+    from unnest(cats) c2(categoria)
+    cross join (select count(*) tot from fato_exame where id_unidade = p_id_unidade) t
+    left join (select e.categoria, count(*) n from fato_exame f join dim_exame e using (id_exame)
+                where f.id_unidade = p_id_unidade group by 1) x on x.categoria = c2.categoria;
+
+  insert into perfil_grupo (id_unidade, grupo, k, silhueta_k, n_perfis, n_exames, destaque, destaque_pp, composicao, membros)
+  select p_id_unidade, row_number() over (order by sum(p.n_exames) desc), best_k, round(best_sil::numeric, 3),
+         count(*), sum(p.n_exames),
+         (select cats[gj] from generate_series(1, D) gj order by best_cent[(p.grupo-1)*D+gj] - geral[gj] desc limit 1),
+         (select round((100 * (best_cent[(p.grupo-1)*D+gj] - geral[gj]))::numeric, 1) from generate_series(1, D) gj
+           order by best_cent[(p.grupo-1)*D+gj] - geral[gj] desc limit 1),
+         (select jsonb_object_agg(cats[gj], round((100 * best_cent[(p.grupo-1)*D+gj])::numeric, 1)) from generate_series(1, D) gj),
+         string_agg(x.sigla || ' ' || fx.descricao, '; ' order by x.id_sexo, fx.ordem)
+    from perfil_demanda p
+    join dim_sexo x on x.id_sexo = p.id_sexo
+    join dim_faixa_etaria fx on fx.id_faixa = p.id_faixa
+   where p.id_unidade = p_id_unidade and p.grupo is not null
+   group by p.grupo;
+
+  -- renumera perfil_demanda.grupo para a mesma numeração por volume
+  update perfil_demanda p set grupo = r.novo
+    from (select grupo antigo, row_number() over (order by sum(n_exames) desc) novo
+            from perfil_demanda where id_unidade = p_id_unidade and grupo is not null group by grupo) r
+   where p.id_unidade = p_id_unidade and p.grupo = r.antigo;
+
+  return jsonb_build_object('status','ok','k',best_k,'silhueta',round(best_sil::numeric,3),'perfis_agrupados',n);
+end $$;
+
+-- Leitura dos perfis para o painel
+create or replace function public.fn_perfis_demanda(p_id_unidade integer default null)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare v_unidade integer;
+begin
+  if auth.uid() is null then raise exception 'Acesso negado.'; end if;
+  v_unidade := coalesce(p_id_unidade, (select min(id_unidade) from perfil_grupo));
+  return jsonb_build_object(
+    'id_unidade', v_unidade,
+    'grupos', (select coalesce(jsonb_agg(to_jsonb(g) - 'id_unidade' order by grupo), '[]')
+                 from perfil_grupo g where id_unidade = v_unidade),
+    'perfis', (select coalesce(jsonb_agg(jsonb_build_object('sexo', x.descricao, 'faixa', fx.descricao,
+                 'ordem', fx.ordem, 'n_exames', p.n_exames, 'grupo', p.grupo, 'silhueta', p.silhueta)
+                 order by x.id_sexo, fx.ordem), '[]')
+                 from perfil_demanda p join dim_sexo x using (id_sexo) join dim_faixa_etaria fx using (id_faixa)
+                where p.id_unidade = v_unidade)
+  );
+end $$;
+
+-- Encadeia o agrupamento ao final da previsão (executada em toda carga concluída)
+create or replace function public.fn_pos_carga(p_id_unidade integer)
+returns jsonb language plpgsql security definer set search_path = public as $$
+begin
+  return jsonb_build_object('previsao', fn_gerar_previsao(p_id_unidade),
+                            'perfis',   fn_gerar_perfis(p_id_unidade));
+end $$;
+
+do $$
+declare f text;
+begin
+  foreach f in array array['fn_gerar_perfis(integer,integer)','fn_perfis_demanda(integer)','fn_pos_carga(integer)']
+  loop
+    execute format('revoke all on function public.%s from public, anon', f);
+    execute format('grant execute on function public.%s to authenticated', f);
+  end loop;
+end $$;
+
+
+-- ======================= PARTE B =======================
+-- ---------------------------------------------------------------------
+-- 3) FINALIZAR CARGA  (validar -> dimensões -> substituir período -> fato)
+-- ---------------------------------------------------------------------
+create or replace function public.fn_finalizar_carga(p_id_carga bigint)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  c           log_carga%rowtype;
+  v_receb     integer;
+  v_valid     integer;
+  v_rejei     integer;
+  v_min       date;
+  v_max       date;
+  v_subst     integer;
+  v_novos     integer;
+  v_erros     text;
+  v_res       jsonb;
+begin
+  if auth.uid() is null then
+    raise exception 'Acesso negado: usuário não autenticado.';
+  end if;
+  select * into c from log_carga where id_carga = p_id_carga for update;
+  if c.id_carga is null or c.status <> 'em_andamento' or c.usuario_id <> auth.uid() then
+    raise exception 'Carga % não está aberta para este usuário.', p_id_carga;
+  end if;
+
+  -- uma carga por unidade de cada vez (evita substituições concorrentes)
+  perform pg_advisory_xact_lock(c.id_unidade);
+
+  -- ---------- VALIDAÇÃO (linha a linha, na staging) ----------
+  update stg_exame s
+     set data_ok = fn_converter_data(s.dia_raw)
+   where s.id_carga = p_id_carga;
+
+  update stg_exame s
+     set erro = nullif(concat_ws('; ',
+           case when s.data_ok is null            then 'data inválida' end,
+           case when s.data_ok > current_date     then 'data futura' end,
+           case when s.data_ok < date '2013-01-01' then 'data anterior ao e-SUS APS' end,
+           case when s.exame_raw is null
+                  or s.exame_raw !~ '^\S+\s+-\s+.+' then 'exame sem código' end,
+           case when s.atendimento_raw is null    then 'tipo de atendimento vazio' end,
+           case when not exists (select 1 from dim_sexo x
+                                  where fn_chave(x.descricao) = fn_chave(s.sexo_raw))
+                                                  then 'sexo fora do domínio' end,
+           case when not exists (select 1 from dim_faixa_etaria f
+                                  where fn_chave(f.descricao) = fn_chave(s.faixa_raw))
+                                                  then 'faixa etária fora do domínio' end
+         ), '')
+   where s.id_carga = p_id_carga;
+
+  select count(*), count(*) filter (where erro is null), count(*) filter (where erro is not null),
+         min(data_ok) filter (where erro is null), max(data_ok) filter (where erro is null)
+    into v_receb, v_valid, v_rejei, v_min, v_max
+    from stg_exame where id_carga = p_id_carga;
+
+  select string_agg(e || ' (' || n || ')', '; ' order by n desc) into v_erros
+    from (select unnest(string_to_array(erro, '; ')) e, count(*) n
+            from stg_exame where id_carga = p_id_carga and erro is not null
+           group by 1) z;
+
+  -- RN-03 | Tolerância a erros: a carga inteira é rejeitada se não houver
+  -- linhas válidas ou se mais de 5% das linhas forem inválidas.
+  if v_valid = 0 or v_rejei::numeric / greatest(v_receb,1) > 0.05 then
+    update log_carga
+       set status = 'rejeitada', finalizado_em = now(),
+           linhas_validas = v_valid, linhas_rejeitadas = v_rejei,
+           mensagem = 'Carga rejeitada: ' || v_rejei || ' de ' || v_receb ||
+                      ' linhas inválidas. ' || coalesce(v_erros,'')
+     where id_carga = p_id_carga;
+    delete from stg_exame where id_carga = p_id_carga;
+    return jsonb_build_object('status','rejeitada','linhas_recebidas',v_receb,
+                              'linhas_rejeitadas',v_rejei,'erros',v_erros);
+  end if;
+
+  -- ---------- DIMENSÕES (membros novos) ----------
+  perform fn_preencher_tempo(v_min, v_max);
+
+  insert into dim_atendimento (descricao, tipo_demanda)
+  select distinct s.atendimento_raw, 'Não classificada'
+    from stg_exame s
+   where s.id_carga = p_id_carga and s.erro is null
+     and not exists (select 1 from dim_atendimento a where a.descricao = s.atendimento_raw);
+
+  with novos as (
+    select distinct on (cod) cod, descr
+      from (select btrim(split_part(s.exame_raw, ' - ', 1)) as cod,
+                   btrim(substr(s.exame_raw, strpos(s.exame_raw, ' - ') + 3)) as descr
+              from stg_exame s
+             where s.id_carga = p_id_carga and s.erro is null) z
+     where not exists (select 1 from dim_exame e where e.codigo = z.cod)
+     order by cod
+  )
+  insert into dim_exame (codigo, descricao, origem_codigo, grupo_sigtap, categoria,
+                         flag_rastreamento, flag_pre_natal)
+  select cod, descr,
+         case when cod ~ '^\d{10}$' then 'SIGTAP' else 'e-SUS (código próprio)' end,
+         fn_grupo_sigtap(cod), fn_classificar_exame(descr),
+         fn_flag_rastreamento(descr), fn_flag_pre_natal(descr)
+    from novos;
+  get diagnostics v_novos = row_count;
+
+  -- ---------- RN-11 | SUBSTITUIÇÃO DO PERÍODO ----------
+  -- Remove do fato todos os registros da unidade entre a menor e a maior
+  -- data do arquivo e grava as linhas do arquivo. Reenviar um período não
+  -- duplica contagens; linhas idênticas legítimas são preservadas (sem
+  -- deduplicação, pois a base não possui identificador de paciente).
+  delete from fato_exame
+   where id_unidade = c.id_unidade
+     and id_data between to_char(v_min,'YYYYMMDD')::int and to_char(v_max,'YYYYMMDD')::int;
+  get diagnostics v_subst = row_count;
+
+  insert into fato_exame (id_data, id_unidade, id_exame, id_atendimento, id_sexo, id_faixa, id_carga)
+  select to_char(s.data_ok,'YYYYMMDD')::int, c.id_unidade, e.id_exame, a.id_atendimento,
+         x.id_sexo, f.id_faixa, p_id_carga
+    from stg_exame s
+    join dim_exame e        on e.codigo = btrim(split_part(s.exame_raw, ' - ', 1))
+    join dim_atendimento a  on a.descricao = s.atendimento_raw
+    join dim_sexo x         on fn_chave(x.descricao) = fn_chave(s.sexo_raw)
+    join dim_faixa_etaria f on fn_chave(f.descricao) = fn_chave(s.faixa_raw)
+   where s.id_carga = p_id_carga and s.erro is null;
+  get diagnostics v_valid = row_count;
+
+  -- ---------- LOG + minimização de dados (LGPD art. 6º, III) ----------
+  update log_carga
+     set status = 'concluida', finalizado_em = now(),
+         linhas_validas = v_valid, linhas_rejeitadas = v_rejei,
+         data_min = v_min, data_max = v_max,
+         linhas_substituidas = v_subst, exames_novos = v_novos,
+         mensagem = case when v_rejei > 0 then 'Linhas descartadas: ' || v_erros end
+   where id_carga = p_id_carga;
+  delete from stg_exame where id_carga = p_id_carga;
+
+  -- ---------- retreino automático: previsão (04) e perfis de demanda (06) ----------
+  perform fn_pos_carga(c.id_unidade);
+
+  v_res := jsonb_build_object(
+    'status','concluida','linhas_recebidas',v_receb,'linhas_carregadas',v_valid,
+    'linhas_rejeitadas',v_rejei,'periodo_inicio',v_min,'periodo_fim',v_max,
+    'linhas_substituidas',v_subst,'exames_novos',v_novos,'erros',v_erros);
+  return v_res;
+end $$;
+
+revoke all on function public.fn_finalizar_carga(bigint) from public, anon;
+grant execute on function public.fn_finalizar_carga(bigint) to authenticated;
+
+-- ======================= PARTE C =======================
+select public.fn_gerar_perfis(u.id_unidade)
+  from public.dim_unidade u
+ where exists (select 1 from public.fato_exame f where f.id_unidade = u.id_unidade);
+```

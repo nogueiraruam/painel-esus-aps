@@ -1,0 +1,14 @@
+(USE ESTE PROMPT SOMENTE SE O PROMPT_2_frontend ANTIGO JÁ TIVER SIDO ENVIADO E AS TELAS JÁ EXISTIREM. Se as telas ainda não foram criadas, envie o PROMPT_2_frontend.txt atualizado, que já contém esta seção.)
+
+Adicione à página "Painel" uma nova seção no final, chamada "Perfis de demanda". Não crie tabelas, não altere o banco e não calcule nada no frontend: os dados vêm prontos da função RPC abaixo. Mantenha todo o restante da página como está.
+
+Chamar:  supabase.rpc('fn_perfis_demanda', { p_id_unidade })   (enviar null para usar a primeira unidade; quando o filtro de Unidade mudar, chamar de novo com a unidade selecionada)
+
+Esta seção NÃO sofre os filtros de período, sexo, ciclo de vida, categoria e tipo de atendimento (o agrupamento usa todos os dados da unidade). Mostre essa observação em texto pequeno abaixo do título.
+
+Conteúdo da seção:
+1. Cabeçalho: "Agrupamento K-means · k = {grupos[0].k} grupos · silhueta média = {grupos[0].silhueta_k}".
+2. Um cartão por grupo (array "grupos"): título "Grupo {grupo}"; linha de destaque "{destaque} (+{destaque_pp} p.p. acima da média)"; linha "{n_perfis} perfis · {n_exames} exames"; e o texto de "membros" (F = feminino, M = masculino).
+3. Mapa de calor (heatmap): categorias nas linhas, grupos nas colunas, valor de "composicao" (% dos exames do grupo) em cada célula, com o número escrito na célula e escala de azul (claro = baixo, escuro = alto).
+4. Grade "sexo × faixa etária" (array "perfis"): linhas = faixas etárias em ordem crescente (campo "ordem"), colunas = Feminino e Masculino. Cada célula é colorida pelo grupo, usando a paleta #2a78d6 (Grupo 1), #eb6834 (Grupo 2), #1baf7a (Grupo 3) e #4a3aa7 (Grupo 4), e mostra no tooltip o n_exames e a silhueta. Perfis com grupo = null aparecem em cinza, com o texto "não agrupado (< 30 exames)". Perfis "Não Informado" podem ser listados abaixo da grade.
+5. Botão "ver tabela" com os mesmos dados dos grupos em formato de tabela.

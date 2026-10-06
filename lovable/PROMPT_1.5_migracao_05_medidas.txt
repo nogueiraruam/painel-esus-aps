@@ -1,0 +1,224 @@
+Aplique a migração SQL abaixo no banco do Lovable Cloud EXATAMENTE como está escrita, sem alterar nomes, tipos, políticas ou funções, e sem criar telas ainda. Ela é a parte 5 de 6 do backend do projeto (arquivo 05_medidas.sql). Depois de aplicar, apenas confirme que foi executada sem erros.
+
+```sql
+-- =====================================================================
+-- 05_medidas.sql
+-- Camada semântica: medidas (KPIs) calculadas no banco e entregues ao
+-- frontend em um único JSON. O frontend NÃO calcula indicadores; apenas
+-- desenha o que recebe. Assim, cada número do painel tem uma única
+-- definição, documentada no Quadro 2 do TCC.
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- Opções dos filtros (listas de valores) e período disponível
+-- ---------------------------------------------------------------------
+create or replace function public.fn_opcoes_filtro()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  if auth.uid() is null then raise exception 'Acesso negado.'; end if;
+  return jsonb_build_object(
+    'unidades',     (select coalesce(jsonb_agg(jsonb_build_object('id',id_unidade,'nome',nome,
+                                     'municipio',municipio,'uf',uf) order by nome),'[]')
+                       from dim_unidade where ativo),
+    'categorias',   (select coalesce(jsonb_agg(distinct categoria),'[]') from dim_exame),
+    'sexos',        (select jsonb_agg(descricao order by id_sexo) from dim_sexo),
+    'ciclos_vida',  (select jsonb_agg(c order by o) from (select ciclo_vida c, min(ordem) o
+                       from dim_faixa_etaria group by 1) z),
+    'atendimentos', (select jsonb_agg(descricao order by descricao) from dim_atendimento),
+    'data_min',     (select min(t.data) from fato_exame f join dim_tempo t using (id_data)),
+    'data_max',     (select max(t.data) from fato_exame f join dim_tempo t using (id_data)),
+    'ultima_carga', (select to_jsonb(l) - 'usuario_id' from log_carga l
+                      where status = 'concluida' order by finalizado_em desc limit 1)
+  );
+end $$;
+
+-- ---------------------------------------------------------------------
+-- Painel completo
+--   Todos os parâmetros são opcionais (null = sem filtro).
+-- ---------------------------------------------------------------------
+create or replace function public.fn_dashboard(
+  p_data_ini     date    default null,
+  p_data_fim     date    default null,
+  p_id_unidade   integer default null,
+  p_sexo         text    default null,
+  p_ciclo_vida   text    default null,
+  p_categoria    text    default null,
+  p_atendimento  text    default null
+) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  v_cob_ini date;  v_cob_fim date;      -- cobertura real dos dados
+  v_ini     date;  v_fim     date;      -- janela efetiva da consulta
+  r         jsonb;
+begin
+  if auth.uid() is null then raise exception 'Acesso negado.'; end if;
+
+  -- RN-12 | Cobertura: período efetivamente extraído do e-SUS (independe dos
+  -- filtros de perfil). Meses e semanas fora da cobertura total são
+  -- marcados como incompletos e excluídos das comparações (MoM, YoY,
+  -- sazonalidade), evitando falsas quedas de demanda.
+  -- RN-12a: a cobertura começa no 1º dia do mês do primeiro registro (os
+  --         relatórios do e-SUS são extraídos por mês; o dia 1º pode ser feriado).
+  -- RN-12b: a cobertura termina na data do último registro (extração parcial).
+  select date_trunc('month', min(t.data))::date, max(t.data) into v_cob_ini, v_cob_fim
+    from fato_exame f join dim_tempo t using (id_data)
+   where p_id_unidade is null or f.id_unidade = p_id_unidade;
+
+  v_ini := greatest(coalesce(p_data_ini, v_cob_ini), v_cob_ini);
+  v_fim := least(coalesce(p_data_fim, v_cob_fim), v_cob_fim);
+
+  with base as (                       -- fato filtrado + atributos das dimensões
+    select t.data, t.ano_mes, t.mes, t.nome_mes, t.inicio_semana,
+           e.codigo, e.descricao as exame, e.categoria, e.flag_rastreamento, e.flag_pre_natal,
+           x.descricao as sexo, fx.descricao as faixa, fx.ordem as faixa_ordem, fx.ciclo_vida,
+           a.descricao as atendimento, a.tipo_demanda, f.qtd
+      from fato_exame f
+      join dim_tempo t         on t.id_data = f.id_data
+      join dim_exame e         on e.id_exame = f.id_exame
+      join dim_sexo x          on x.id_sexo = f.id_sexo
+      join dim_faixa_etaria fx on fx.id_faixa = f.id_faixa
+      join dim_atendimento a   on a.id_atendimento = f.id_atendimento
+     where t.data between v_ini and v_fim
+       and (p_id_unidade  is null or f.id_unidade  = p_id_unidade)
+       and (p_sexo        is null or x.descricao   = p_sexo)
+       and (p_ciclo_vida  is null or fx.ciclo_vida = p_ciclo_vida)
+       and (p_categoria   is null or e.categoria   = p_categoria)
+       and (p_atendimento is null or a.descricao   = p_atendimento)
+  ),
+  agg_mes as (select ano_mes, sum(qtd) n from base group by 1),
+  agg_sem as (select inicio_semana, sum(qtd) n from base group by 1),
+  meses as (                           -- série mensal com flag de completude
+    select to_char(m,'YYYY-MM') as ano_mes, extract(month from m)::int as mes,
+           (m::date >= v_ini and (m + interval '1 month - 1 day')::date <= v_fim) as completo,
+           coalesce(a.n,0)::int as total
+      from generate_series(date_trunc('month', v_ini), date_trunc('month', v_fim), interval '1 month') m
+      left join agg_mes a on a.ano_mes = to_char(m,'YYYY-MM')
+  ),
+  mc as (select * from meses where completo),
+  ult as (select ano_mes, mes, total from mc order by ano_mes desc limit 1),
+  ant as (select m.total from mc m, ult u
+           where m.ano_mes = to_char(to_date(u.ano_mes,'YYYY-MM') - interval '1 month','YYYY-MM')),
+  yoy as (select m.total from mc m, ult u
+           where m.ano_mes = to_char(to_date(u.ano_mes,'YYYY-MM') - interval '1 year','YYYY-MM')),
+  semanas as (
+    select g::date as inicio_semana,
+           (g::date >= v_ini and g::date + 6 <= v_fim) as completa,
+           coalesce(a.n,0)::int as total
+      from generate_series((v_ini - extract(dow from v_ini)::int), v_fim, interval '7 day') g
+      left join agg_sem a on a.inicio_semana = g::date
+  )
+  select jsonb_build_object(
+    'filtros', jsonb_build_object('data_ini',v_ini,'data_fim',v_fim,'id_unidade',p_id_unidade,
+               'sexo',p_sexo,'ciclo_vida',p_ciclo_vida,'categoria',p_categoria,'atendimento',p_atendimento,
+               'cobertura_ini',v_cob_ini,'cobertura_fim',v_cob_fim),
+
+    -- ===================== KPIs (Quadro 2) =====================
+    'kpis', (select jsonb_build_object(
+        -- M01 Total de exames = Σ qtd
+        'total_exames',        coalesce(sum(qtd),0),
+        -- M02 Média diária = Σ qtd ÷ nº de dias com registro
+        'dias_com_registro',   count(distinct data),
+        'media_diaria',        round(coalesce(sum(qtd),0)::numeric / nullif(count(distinct data),0), 1),
+        -- M03 % por sexo = exames do sexo ÷ (Feminino + Masculino)
+        'pct_feminino',        round(100.0 * sum(qtd) filter (where sexo='Feminino')
+                                 / nullif(sum(qtd) filter (where sexo in ('Feminino','Masculino')),0), 1),
+        'pct_masculino',       round(100.0 * sum(qtd) filter (where sexo='Masculino')
+                                 / nullif(sum(qtd) filter (where sexo in ('Feminino','Masculino')),0), 1),
+        'nao_informado',       coalesce(sum(qtd) filter (where sexo='Não Informado'),0),
+        -- M04 Taxa de rastreamento (preventivos) = exames com flag ÷ total
+        'exames_rastreamento', coalesce(sum(qtd) filter (where flag_rastreamento),0),
+        'taxa_rastreamento',   round(100.0 * sum(qtd) filter (where flag_rastreamento) / nullif(sum(qtd),0), 1),
+        -- M06 Exames do pré-natal = Σ qtd com flag_pre_natal
+        'exames_pre_natal',    coalesce(sum(qtd) filter (where flag_pre_natal),0),
+        -- (apoio) % demanda espontânea
+        'pct_demanda_espontanea', round(100.0 * sum(qtd) filter (where tipo_demanda='Espontânea') / nullif(sum(qtd),0), 1),
+        -- M07 Variação mensal (MoM) e M08 anual (YoY): apenas meses completos
+        'mes_referencia',      (select ano_mes from ult),
+        'total_mes_referencia',(select total from ult),
+        'var_mom_pct',         (select round(100.0 * (u.total - a.total) / nullif(a.total,0), 1) from ult u, ant a),
+        'var_yoy_pct',         (select round(100.0 * (u.total - y.total) / nullif(y.total,0), 1) from ult u, yoy y)
+      ) from base),
+
+    -- M05 Participação por categoria = exames da categoria ÷ total filtrado
+    'categorias', (select coalesce(jsonb_agg(jsonb_build_object('categoria',categoria,'total',n,
+                     'pct',pct) order by n desc),'[]')
+                     from (select categoria, n, round(100.0*n/sum(n) over (),1) pct
+                             from (select categoria, sum(qtd) n from base group by 1) z0) z),
+
+    'serie_mensal', (select coalesce(jsonb_agg(jsonb_build_object('ano_mes',ano_mes,'total',total,
+                       'completo',completo) order by ano_mes),'[]') from meses),
+
+    -- M09 Índice de sazonalidade = média do mês-calendário ÷ média geral (meses completos)
+    'sazonalidade', (select coalesce(jsonb_agg(jsonb_build_object('mes',mes,
+                       'nome_mes',(array['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'])[mes],
+                       'media',round(media,1),'n_meses',n_meses,
+                       'indice',round(media / nullif((select avg(total) from mc),0),2)) order by mes),'[]')
+                       from (select mes, avg(total) media, count(*) n_meses from mc group by mes) z),
+
+    'serie_semanal', (select coalesce(jsonb_agg(jsonb_build_object('inicio_semana',inicio_semana,
+                        'total',total,'completa',completa) order by inicio_semana),'[]') from semanas),
+
+    -- M10 Previsão das próximas 8 semanas (volume total; não sofre filtros de perfil)
+    'previsao', (select coalesce(jsonb_agg(jsonb_build_object('inicio_semana',inicio_semana,
+                   'horizonte',horizonte,'previsto',previsto,'limite_inf',limite_inf,
+                   'limite_sup',limite_sup) order by inicio_semana),'[]')
+                   from (select inicio_semana, min(horizonte) horizonte, sum(previsto) previsto,
+                                sum(limite_inf) limite_inf, sum(limite_sup) limite_sup
+                           from previsao_semanal
+                          where p_id_unidade is null or id_unidade = p_id_unidade
+                          group by inicio_semana) p),
+    'modelo', (select to_jsonb(m) from previsao_metricas m
+                where p_id_unidade is null or m.id_unidade = p_id_unidade
+                order by gerado_em desc limit 1),
+
+    'piramide', (select coalesce(jsonb_agg(jsonb_build_object('faixa',faixa,'ordem',faixa_ordem,
+                   'feminino',f,'masculino',m,'nao_informado',ni) order by faixa_ordem),'[]')
+                   from (select faixa, faixa_ordem,
+                                coalesce(sum(qtd) filter (where sexo='Feminino'),0) f,
+                                coalesce(sum(qtd) filter (where sexo='Masculino'),0) m,
+                                coalesce(sum(qtd) filter (where sexo='Não Informado'),0) ni
+                           from base group by 1,2) z),
+
+    'ciclos_vida', (select coalesce(jsonb_agg(jsonb_build_object('ciclo_vida',ciclo_vida,'total',n,
+                      'pct',pct) order by o),'[]')
+                      from (select ciclo_vida, o, n, round(100.0*n/sum(n) over (),1) pct
+                              from (select ciclo_vida, min(faixa_ordem) o, sum(qtd) n from base group by 1) z0) z),
+
+    'atendimentos', (select coalesce(jsonb_agg(jsonb_build_object('atendimento',atendimento,
+                       'tipo_demanda',tipo_demanda,'total',n,'pct',pct)
+                       order by n desc),'[]')
+                       from (select atendimento, tipo_demanda, n, round(100.0*n/sum(n) over (),1) pct
+                               from (select atendimento, tipo_demanda, sum(qtd) n from base group by 1,2) z0) z),
+
+    'top_exames', (select coalesce(jsonb_agg(jsonb_build_object('codigo',codigo,'exame',exame,
+                     'categoria',categoria,'total',n) order by n desc),'[]')
+                     from (select codigo, exame, categoria, sum(qtd) n from base
+                            group by 1,2,3 order by 4 desc limit 10) z)
+  ) into r;
+
+  return r;
+end $$;
+
+-- =====================================================================
+-- PERMISSÕES DE EXECUÇÃO: somente usuários autenticados.
+-- =====================================================================
+do $$
+declare f text;
+begin
+  foreach f in array array[
+    'fn_iniciar_carga(integer,text)',
+    'fn_enviar_lote(bigint,jsonb)',
+    'fn_finalizar_carga(bigint)',
+    'fn_cancelar_carga(bigint,text)',
+    'fn_reclassificar_exames()',
+    'fn_gerar_previsao(integer,integer)',
+    'fn_serie_semanal(integer)',
+    'fn_preencher_tempo(date,date)',
+    'fn_opcoes_filtro()',
+    'fn_dashboard(date,date,integer,text,text,text,text)']
+  loop
+    execute format('revoke all on function public.%s from public, anon', f);
+    execute format('grant execute on function public.%s to authenticated', f);
+  end loop;
+end $$;
+```

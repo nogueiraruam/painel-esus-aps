@@ -1,0 +1,221 @@
+Aplique a migração SQL abaixo no banco do Lovable Cloud EXATAMENTE como está escrita, sem alterar nomes, tipos, políticas ou funções, e sem criar telas ainda. Ela é a parte 1 de 6 do backend do projeto (arquivo 01_estrutura.sql). Depois de aplicar, apenas confirme que foi executada sem erros.
+
+```sql
+-- =====================================================================
+-- 01_estrutura.sql
+-- Dashboard Preditivo e-SUS APS | Modelo dimensional (esquema estrela)
+-- Autor: Ruan Carlos Damião Nogueira Rêgo | MBA DSA USP/Esalq
+--
+-- Camadas:
+--   (1) STAGING   : stg_exame   -> recebe as linhas do arquivo como texto
+--   (2) DIMENSÕES : dim_tempo, dim_unidade, dim_exame, dim_atendimento,
+--                   dim_sexo, dim_faixa_etaria
+--   (3) FATO      : fato_exame  -> grão = 1 exame registrado no e-SUS
+--   (4) CONTROLE  : log_carga, regra_categoria
+--   (5) ANALÍTICA : previsao_semanal, previsao_metricas
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- DIMENSÃO TEMPO  (chave inteligente AAAAMMDD)
+-- ---------------------------------------------------------------------
+create table if not exists public.dim_tempo (
+  id_data        integer primary key,           -- ex.: 20250502
+  data           date    not null unique,
+  ano            smallint not null,
+  semestre       smallint not null,
+  trimestre      smallint not null,
+  mes            smallint not null,
+  nome_mes       text    not null,
+  ano_mes        text    not null,              -- 'AAAA-MM' (ordenável)
+  dia            smallint not null,
+  dia_semana     smallint not null,             -- 0 = domingo ... 6 = sábado
+  nome_dia       text    not null,
+  fim_de_semana  boolean not null,
+  inicio_semana  date    not null,              -- domingo da semana epidemiológica
+  semana_epi     smallint not null,             -- semana epidemiológica (MS)
+  ano_epi        smallint not null
+);
+
+-- ---------------------------------------------------------------------
+-- DIMENSÃO UNIDADE  (preparada para várias UBS / municípios)
+-- ---------------------------------------------------------------------
+create table if not exists public.dim_unidade (
+  id_unidade  serial primary key,
+  nome        text not null unique,
+  municipio   text not null,
+  uf          char(2) not null,
+  cnes        text,
+  ativo       boolean not null default true
+);
+
+-- ---------------------------------------------------------------------
+-- DIMENSÃO EXAME  (código SIGTAP ou código próprio do e-SUS)
+-- ---------------------------------------------------------------------
+create table if not exists public.dim_exame (
+  id_exame           serial primary key,
+  codigo             text not null unique,      -- '0202010678' | 'ABEX028'
+  descricao          text not null,
+  origem_codigo      text not null,             -- 'SIGTAP' | 'e-SUS (código próprio)'
+  grupo_sigtap       text not null,             -- subgrupo SIGTAP (02.02, 02.14 ...)
+  categoria          text not null,             -- categoria temática (regra_categoria)
+  flag_rastreamento  boolean not null default false,  -- preventivo (colo/mama)
+  flag_pre_natal     boolean not null default false,  -- gestante / parceiro / obstétrico
+  classificado_por   text not null default 'regra',   -- 'regra' | 'manual'
+  criado_em          timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------------------
+-- DIMENSÃO TIPO DE ATENDIMENTO
+-- ---------------------------------------------------------------------
+create table if not exists public.dim_atendimento (
+  id_atendimento  serial primary key,
+  descricao       text not null unique,
+  tipo_demanda    text not null                 -- 'Programada' | 'Espontânea' | 'Urgência'
+);
+
+-- ---------------------------------------------------------------------
+-- DIMENSÃO SEXO
+-- ---------------------------------------------------------------------
+create table if not exists public.dim_sexo (
+  id_sexo    smallint primary key,
+  descricao  text not null unique,
+  sigla      char(1) not null
+);
+
+-- ---------------------------------------------------------------------
+-- DIMENSÃO FAIXA ETÁRIA  (21 faixas originais do e-SUS + hierarquia)
+-- ---------------------------------------------------------------------
+create table if not exists public.dim_faixa_etaria (
+  id_faixa        smallint primary key,
+  descricao       text not null unique,         -- valor original do e-SUS
+  ordem           smallint not null,
+  idade_min       smallint not null,
+  idade_max       smallint,                     -- null = sem limite superior
+  faixa_agrupada  text not null,                -- quinquenal (01 a 04 anos unificado)
+  ciclo_vida      text not null                 -- Criança | Adolescente | Adulto | Idoso
+);
+
+-- ---------------------------------------------------------------------
+-- CONTROLE DE CARGAS (auditoria / rastreabilidade)
+-- ---------------------------------------------------------------------
+create table if not exists public.log_carga (
+  id_carga             bigserial primary key,
+  id_unidade           integer not null references public.dim_unidade,
+  nome_arquivo         text not null,
+  usuario_id           uuid,
+  usuario_email        text,
+  iniciado_em          timestamptz not null default now(),
+  finalizado_em        timestamptz,
+  status               text not null default 'em_andamento'
+                       check (status in ('em_andamento','concluida','rejeitada')),
+  linhas_recebidas     integer not null default 0,
+  linhas_validas       integer,
+  linhas_rejeitadas    integer,
+  data_min             date,
+  data_max             date,
+  linhas_substituidas  integer,
+  exames_novos         integer,
+  mensagem             text
+);
+
+-- ---------------------------------------------------------------------
+-- STAGING  (área de pouso: tudo como texto, sem confiar no arquivo)
+-- ---------------------------------------------------------------------
+create table if not exists public.stg_exame (
+  id_carga         bigint  not null references public.log_carga on delete cascade,
+  n_linha          integer not null,
+  dia_raw          text,
+  exame_raw        text,
+  atendimento_raw  text,
+  sexo_raw         text,
+  faixa_raw        text,
+  -- colunas preenchidas na validação
+  data_ok          date,
+  erro             text,
+  primary key (id_carga, n_linha)
+);
+
+-- ---------------------------------------------------------------------
+-- FATO EXAME  (grão: 1 linha = 1 exame registrado)
+-- ---------------------------------------------------------------------
+create table if not exists public.fato_exame (
+  id_fato         bigserial primary key,
+  id_data         integer  not null references public.dim_tempo,
+  id_unidade      integer  not null references public.dim_unidade,
+  id_exame        integer  not null references public.dim_exame,
+  id_atendimento  integer  not null references public.dim_atendimento,
+  id_sexo         smallint not null references public.dim_sexo,
+  id_faixa        smallint not null references public.dim_faixa_etaria,
+  qtd             smallint not null default 1 check (qtd = 1),
+  id_carga        bigint   not null references public.log_carga
+);
+create index if not exists ix_fato_unidade_data on public.fato_exame (id_unidade, id_data);
+create index if not exists ix_fato_exame        on public.fato_exame (id_exame);
+create index if not exists ix_fato_carga        on public.fato_exame (id_carga);
+
+-- ---------------------------------------------------------------------
+-- REGRAS DE NEGÓCIO PARAMETRIZÁVEIS: categorização temática de exames
+-- ---------------------------------------------------------------------
+create table if not exists public.regra_categoria (
+  id_regra    serial primary key,
+  prioridade  integer not null unique,          -- menor = avaliada primeiro
+  padrao      text    not null,                 -- expressão regular (POSIX)
+  categoria   text    not null,
+  ativo       boolean not null default true
+);
+
+-- ---------------------------------------------------------------------
+-- CAMADA PREDITIVA
+-- ---------------------------------------------------------------------
+create table if not exists public.previsao_semanal (
+  id_unidade     integer not null references public.dim_unidade,
+  inicio_semana  date    not null,
+  horizonte      smallint not null,             -- 1..8 semanas à frente
+  previsto       numeric(10,1) not null,
+  limite_inf     numeric(10,1) not null,
+  limite_sup     numeric(10,1) not null,
+  modelo         text not null,
+  gerado_em      timestamptz not null default now(),
+  primary key (id_unidade, inicio_semana)
+);
+
+create table if not exists public.previsao_metricas (
+  id_unidade        integer primary key references public.dim_unidade,
+  modelo            text not null,
+  alpha             numeric(4,2) not null,
+  sigma             numeric(10,2) not null,     -- desvio-padrão dos resíduos 1 passo
+  mae_treino        numeric(10,2) not null,
+  semanas_treino    integer not null,
+  ultima_semana     date not null,
+  gerado_em         timestamptz not null default now()
+);
+
+-- =====================================================================
+-- SEGURANÇA (LGPD art. 11 e art. 46): Row Level Security
+--   * Somente usuários autenticados LEEM dimensões, fato e previsões.
+--   * Ninguém escreve diretamente: toda escrita passa pelas funções
+--     SECURITY DEFINER do ETL (03_etl.sql), que validam o usuário.
+--   * A staging não é visível a nenhum cliente.
+-- =====================================================================
+do $$
+declare t text;
+begin
+  foreach t in array array['dim_tempo','dim_unidade','dim_exame','dim_atendimento',
+                           'dim_sexo','dim_faixa_etaria','fato_exame','log_carga',
+                           'stg_exame','regra_categoria','previsao_semanal','previsao_metricas']
+  loop
+    execute format('alter table public.%I enable row level security', t);
+    execute format('revoke all on public.%I from anon, authenticated', t);
+  end loop;
+
+  foreach t in array array['dim_tempo','dim_unidade','dim_exame','dim_atendimento',
+                           'dim_sexo','dim_faixa_etaria','fato_exame','log_carga',
+                           'regra_categoria','previsao_semanal','previsao_metricas']
+  loop
+    execute format('grant select on public.%I to authenticated', t);
+    execute format('drop policy if exists leitura_autenticada on public.%I', t);
+    execute format('create policy leitura_autenticada on public.%I
+                    for select to authenticated using (auth.uid() is not null)', t);
+  end loop;
+end $$;
+```

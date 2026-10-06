@@ -1,0 +1,9 @@
+,MAE,RMSE,MAPE (%)
+Holt amortecido,31.62,51.4,37.37
+"SES – ETS(A,N,N)",31.85,53.13,34.9
+Holt,31.88,53.16,34.91
+Média móvel (8 sem.),33.38,50.56,42.09
+Média móvel (4 sem.),44.81,62.52,42.15
+Ingênuo,60.38,76.62,52.52
+Regressão de Poisson,62.31,66.6,88.47
+Ingênuo sazonal (52 sem.),120.88,140.56,172.16

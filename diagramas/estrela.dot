@@ -1,0 +1,87 @@
+graph estrela {
+  graph [layout=neato, overlap=false, splines=true, bgcolor="white", pad=0.2, dpi=300, fontname="Helvetica"];
+  node  [shape=plain, fontname="Helvetica", fontsize=10];
+  edge  [color="#8a8984", penwidth=1.2, fontname="Helvetica", fontsize=9, fontcolor="#52514e"];
+
+  fato [pos="0,0!", label=<
+   <table border="1" cellborder="0" cellspacing="0" cellpadding="3" color="#2a78d6">
+    <tr><td bgcolor="#2a78d6" colspan="2"><font color="white"><b>fato_exame</b></font></td></tr>
+    <tr><td align="left"><b>PK</b></td><td align="left">id_fato</td></tr>
+    <tr><td align="left">FK</td><td align="left">id_data</td></tr>
+    <tr><td align="left">FK</td><td align="left">id_unidade</td></tr>
+    <tr><td align="left">FK</td><td align="left">id_exame</td></tr>
+    <tr><td align="left">FK</td><td align="left">id_atendimento</td></tr>
+    <tr><td align="left">FK</td><td align="left">id_sexo</td></tr>
+    <tr><td align="left">FK</td><td align="left">id_faixa</td></tr>
+    <tr><td align="left">FK</td><td align="left">id_carga</td></tr>
+    <tr><td align="left"><i>medida</i></td><td align="left">qtd (= 1)</td></tr>
+    <tr><td colspan="2"><font point-size="8" color="#52514e">grão: 1 exame registrado</font></td></tr>
+   </table>>];
+
+  tempo [pos="-3.4,2.2!", label=<
+   <table border="1" cellborder="0" cellspacing="0" cellpadding="2" color="#52514e">
+    <tr><td bgcolor="#e8e7e2" colspan="2"><b>dim_tempo</b></td></tr>
+    <tr><td align="left"><b>PK</b></td><td align="left">id_data (AAAAMMDD)</td></tr>
+    <tr><td></td><td align="left">data, ano, semestre, trimestre</td></tr>
+    <tr><td></td><td align="left">mes, nome_mes, ano_mes</td></tr>
+    <tr><td></td><td align="left">dia_semana, fim_de_semana</td></tr>
+    <tr><td></td><td align="left">inicio_semana, semana_epi, ano_epi</td></tr>
+   </table>>];
+
+  unidade [pos="3.4,2.2!", label=<
+   <table border="1" cellborder="0" cellspacing="0" cellpadding="2" color="#52514e">
+    <tr><td bgcolor="#e8e7e2" colspan="2"><b>dim_unidade</b></td></tr>
+    <tr><td align="left"><b>PK</b></td><td align="left">id_unidade</td></tr>
+    <tr><td></td><td align="left">nome, municipio, uf</td></tr>
+    <tr><td></td><td align="left">cnes, ativo</td></tr>
+   </table>>];
+
+  exame [pos="4.0,-0.2!", label=<
+   <table border="1" cellborder="0" cellspacing="0" cellpadding="2" color="#52514e">
+    <tr><td bgcolor="#e8e7e2" colspan="2"><b>dim_exame</b></td></tr>
+    <tr><td align="left"><b>PK</b></td><td align="left">id_exame</td></tr>
+    <tr><td align="left">UK</td><td align="left">codigo (SIGTAP / e-SUS)</td></tr>
+    <tr><td></td><td align="left">descricao, origem_codigo</td></tr>
+    <tr><td></td><td align="left">grupo_sigtap, categoria</td></tr>
+    <tr><td></td><td align="left">flag_rastreamento, flag_pre_natal</td></tr>
+   </table>>];
+
+  atend [pos="3.0,-2.6!", label=<
+   <table border="1" cellborder="0" cellspacing="0" cellpadding="2" color="#52514e">
+    <tr><td bgcolor="#e8e7e2" colspan="2"><b>dim_atendimento</b></td></tr>
+    <tr><td align="left"><b>PK</b></td><td align="left">id_atendimento</td></tr>
+    <tr><td></td><td align="left">descricao, tipo_demanda</td></tr>
+   </table>>];
+
+  sexo [pos="-3.0,-2.6!", label=<
+   <table border="1" cellborder="0" cellspacing="0" cellpadding="2" color="#52514e">
+    <tr><td bgcolor="#e8e7e2" colspan="2"><b>dim_sexo</b></td></tr>
+    <tr><td align="left"><b>PK</b></td><td align="left">id_sexo</td></tr>
+    <tr><td></td><td align="left">descricao, sigla</td></tr>
+   </table>>];
+
+  faixa [pos="-4.0,-0.2!", label=<
+   <table border="1" cellborder="0" cellspacing="0" cellpadding="2" color="#52514e">
+    <tr><td bgcolor="#e8e7e2" colspan="2"><b>dim_faixa_etaria</b></td></tr>
+    <tr><td align="left"><b>PK</b></td><td align="left">id_faixa</td></tr>
+    <tr><td></td><td align="left">descricao (21 faixas), ordem</td></tr>
+    <tr><td></td><td align="left">idade_min, idade_max</td></tr>
+    <tr><td></td><td align="left">faixa_agrupada, ciclo_vida</td></tr>
+   </table>>];
+
+  log [pos="0,-3.1!", label=<
+   <table border="1" cellborder="0" cellspacing="0" cellpadding="2" color="#eb6834" style="dashed">
+    <tr><td bgcolor="#fbe3d8" colspan="2"><b>log_carga</b> <font point-size="8">(controle)</font></td></tr>
+    <tr><td align="left"><b>PK</b></td><td align="left">id_carga</td></tr>
+    <tr><td></td><td align="left">arquivo, usuário, status</td></tr>
+    <tr><td></td><td align="left">período substituído, linhas</td></tr>
+   </table>>];
+
+  tempo -- fato   [headlabel="N", taillabel="1"];
+  unidade -- fato [headlabel="N", taillabel="1"];
+  exame -- fato   [headlabel="N", taillabel="1"];
+  atend -- fato   [headlabel="N", taillabel="1"];
+  sexo -- fato    [headlabel="N", taillabel="1"];
+  faixa -- fato   [headlabel="N", taillabel="1"];
+  log -- fato     [headlabel="N", taillabel="1", style=dashed, color="#eb6834"];
+}

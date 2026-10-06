@@ -1,0 +1,75 @@
+Crie o frontend de um painel analítico chamado "Painel Preditivo e-SUS APS" para a gestão de uma Unidade Básica de Saúde. O backend JÁ EXISTE no Lovable Cloud (tabelas, regras de segurança e funções foram criadas pelas migrações anteriores). NÃO crie tabelas novas, NÃO altere as migrações e NÃO calcule indicadores no frontend: todos os números vêm prontos das funções RPC descritas abaixo. Todo o texto da interface em português do Brasil.
+
+=== 1. AUTENTICAÇÃO ===
+- Tela de login com e-mail e senha (supabase.auth.signInWithPassword). NÃO crie tela de cadastro nem link "criar conta". Inclua "Esqueci minha senha" (resetPasswordForEmail).
+- Todas as outras rotas são protegidas: sem sessão, redirecionar para /login. Botão "Sair" no topo.
+- Encerrar a sessão automaticamente após 30 minutos sem interação.
+
+=== 2. LAYOUT GERAL ===
+- Barra superior: título "Painel Preditivo e-SUS APS", nome da unidade selecionada, data da última carga (de fn_opcoes_filtro().ultima_carga.finalizado_em) e botão Sair.
+- Menu lateral com 3 páginas: "Painel", "Carga de dados" e "Histórico de cargas".
+- Visual limpo e institucional: fundo claro, cartões brancos com borda suave, tipografia Inter, cor principal azul #2a78d6, cor de destaque laranja #eb6834 (usar laranja SOMENTE para previsão), cinza #8a8984 para elementos neutros. Responsivo (funciona no celular).
+- Gráficos com Recharts, com tooltip ao passar o mouse, eixos discretos, sem gráficos 3D e sem eixo Y duplo.
+
+=== 3. PÁGINA "PAINEL" ===
+Ao abrir, chamar:  supabase.rpc('fn_opcoes_filtro')  → preenche os filtros.
+Depois, e a cada mudança de filtro, chamar:
+  supabase.rpc('fn_dashboard', { p_data_ini, p_data_fim, p_id_unidade, p_sexo, p_ciclo_vida, p_categoria, p_atendimento })
+(enviar null quando o filtro estiver em "Todos").
+
+3.1 Linha de filtros (uma linha no topo): Período (data início/fim, padrão = data_min a data_max), Unidade, Sexo, Ciclo de vida, Categoria de exame, Tipo de atendimento, botão "Limpar filtros".
+
+3.2 Linha de KPIs (cartões) usando o objeto "kpis":
+- Total de exames (total_exames)
+- Média diária (media_diaria) – subtítulo "em {dias_com_registro} dias com registro"
+- % Feminino (pct_feminino) e % Masculino (pct_masculino)
+- Taxa de rastreamento (taxa_rastreamento %) – subtítulo "{exames_rastreamento} citopatológicos/mamografias"
+- Exames do pré-natal (exames_pre_natal)
+- Variação mensal (var_mom_pct %) e Variação anual (var_yoy_pct %) – subtítulo "referência: {mes_referencia}"; seta verde para cima se positivo, vermelha para baixo se negativo; mostrar "—" se null.
+Abaixo dos cartões, nota pequena: "Meses incompletos não entram nas comparações."
+
+3.3 Gráficos:
+a) "Exames por mês" – barras (serie_mensal). Barras com completo=false em cinza claro e com rótulo "parcial".
+b) "Exames por semana e previsão" – linha azul com serie_semanal (somente completa=true) + linha laranja tracejada com "previsao.previsto" + faixa laranja translúcida entre limite_inf e limite_sup. Legenda: "Observado", "Previsão (SES)", "Intervalo de 95%". Abaixo, texto: "Modelo: {modelo.modelo} · α = {modelo.alpha} · treinado com {modelo.semanas_treino} semanas · a previsão refere-se ao volume total da unidade".
+c) "Exames por categoria" – barras horizontais ordenadas (categorias: categoria, total, pct).
+d) "Pirâmide etária por sexo" – barras horizontais espelhadas (piramide: feminino à esquerda, masculino à direita, faixas em ordem crescente de baixo para cima).
+e) "Índice de sazonalidade" – barras por mês do ano (sazonalidade.indice) com linha de referência em 1,0; tooltip mostrando "média" e "n_meses".
+f) "Tipo de atendimento" – barras horizontais (atendimentos) com o tipo_demanda no tooltip.
+g) "Ciclo de vida" – barras (ciclos_vida).
+h) "Top 10 exames" – tabela (top_exames: codigo, exame, categoria, total).
+Cada gráfico deve ter um botão "ver tabela" que mostra os mesmos dados em tabela (acessibilidade).
+
+3.4 Seção "Perfis de demanda" (no fim da página Painel). Chamar:
+  supabase.rpc('fn_perfis_demanda', { p_id_unidade })   (null = primeira unidade)
+Esta seção NÃO sofre os filtros de sexo/ciclo/categoria/atendimento (o agrupamento usa todos os dados da unidade); mostrar essa observação em texto pequeno.
+- Cabeçalho: "Agrupamento K-means · k = {grupos[0].k} grupos · silhueta média = {grupos[0].silhueta_k}".
+- Um cartão por grupo (grupos[]): título "Grupo {grupo}", destaque "{destaque} (+{destaque_pp} p.p. acima da média)", "{n_perfis} perfis · {n_exames} exames" e a lista "membros" (F = feminino, M = masculino).
+- Mapa de calor (heatmap) com as categorias nas linhas, os grupos nas colunas e o valor de composicao (% dos exames do grupo) em cada célula, em escala de azul (claro = baixo, escuro = alto) e com o número escrito na célula.
+- Grade "sexo × faixa etária" (perfis[]): linhas = faixas em ordem crescente, colunas = Feminino e Masculino; cada célula mostra o grupo (cor por grupo usando a paleta categórica #2a78d6, #eb6834, #1baf7a, #4a3aa7) e, no tooltip, n_exames e silhueta; perfis com grupo = null aparecem em cinza com o texto "não agrupado (< 30 exames)".
+
+=== 4. PÁGINA "CARGA DE DADOS" ===
+Objetivo: enviar o relatório gerencial de exames exportado do e-SUS (.xlsb ou .xlsx) para o banco.
+- Seletor de unidade (lista de fn_opcoes_filtro().unidades) e área de arrastar/soltar arquivo (aceitar somente .xlsb, .xlsx, .xls; máximo 20 MB).
+- Ler o arquivo NO NAVEGADOR com SheetJS (importar de https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs ou pacote npm "xlsx" da CDN oficial do SheetJS):
+    const wb = XLSX.read(await file.arrayBuffer());
+    const linhas = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { raw: true, defval: null });
+- Antes de enviar, verificar se a primeira linha tem as colunas: Dia, Exame, Tipo de Atendimento, Sexo, Faixa Etária. Se faltar alguma, mostrar erro e NÃO enviar.
+- Mostrar pré-visualização: nº de linhas e as 5 primeiras linhas.
+- Botão "Enviar carga" executa EXATAMENTE esta sequência:
+    1) const { data: id } = await supabase.rpc('fn_iniciar_carga', { p_id_unidade, p_nome_arquivo: file.name })
+    2) para cada bloco de 5.000 linhas:  await supabase.rpc('fn_enviar_lote', { p_id_carga: id, p_linhas: bloco })
+       (barra de progresso "Enviando lote X de Y")
+    3) const { data: resultado } = await supabase.rpc('fn_finalizar_carga', { p_id_carga: id })
+    Se qualquer passo falhar: chamar supabase.rpc('fn_cancelar_carga', { p_id_carga: id, p_motivo: mensagemDoErro }) e mostrar o erro.
+- Exibir o resultado (JSON retornado) em um cartão: status (concluída = verde, rejeitada = vermelho), linhas recebidas, linhas carregadas, linhas rejeitadas, período substituído (periodo_inicio a periodo_fim), linhas substituídas, exames novos e erros.
+- Texto de ajuda fixo na página: "A carga substitui todos os registros da unidade entre a menor e a maior data do arquivo. Reenviar um período não duplica dados. Se mais de 5% das linhas forem inválidas, a carga inteira é rejeitada."
+- Não guardar o conteúdo do arquivo em localStorage, sessionStorage ou em qualquer outro lugar.
+
+=== 5. PÁGINA "HISTÓRICO DE CARGAS" ===
+- Tabela lendo supabase.from('log_carga').select('id_carga, nome_arquivo, usuario_email, iniciado_em, finalizado_em, status, linhas_recebidas, linhas_validas, linhas_rejeitadas, data_min, data_max, linhas_substituidas, exames_novos, mensagem').order('id_carga', { ascending: false })
+- Status com etiqueta colorida; mensagem completa no tooltip.
+
+=== 6. SEGURANÇA ===
+- Nunca usar a service_role key no frontend; usar apenas o cliente padrão do Lovable Cloud.
+- Não exibir dados se a sessão expirar; tratar erros "Acesso negado" redirecionando para o login.
+- Não usar console.log com dados do painel.

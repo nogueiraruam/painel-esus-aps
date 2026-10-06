@@ -1,0 +1,42 @@
+Reorganize o TOPO da página "Painel" para o gestor da UBS entender a situação em poucos segundos. O backend já está pronto: NÃO crie tabelas, NÃO altere o banco e NÃO calcule indicadores nem escreva textos de insight no frontend. Tudo vem pronto da função RPC abaixo. Mantenha o visual limpo: muito espaço em branco, no máximo 4 números em destaque e no máximo 3 insights visíveis de início.
+
+Chamar ao abrir a página e quando o filtro de Unidade mudar:
+  supabase.rpc('fn_resumo_executivo', { p_id_unidade })   (null = primeira unidade)
+Esta parte NÃO sofre os filtros de período, sexo, ciclo de vida, categoria e tipo de atendimento (sempre mostra a situação mais recente da unidade).
+
+=== 1. FAIXA "RESUMO DA UNIDADE" (primeira coisa da página, acima dos filtros) ===
+- Linha pequena no topo, em cinza: "Dados até {dados_ate em dd/mm/aaaa} · Última carga em {ultima_carga em dd/mm/aaaa}".
+  Se dias_desde_ultimo_dado > 45, mostrar no lugar um aviso discreto em âmbar: "Os dados terminam em {dados_ate}. Envie um relatório atualizado em Carga de dados." (com link para a página Carga de dados).
+- Abaixo, a frase do campo "frase", em fonte um pouco maior (18 px), cor de texto principal, no máximo 2 linhas. Ela é o resumo executivo.
+- Abaixo, 4 cartões compactos em uma única linha (no celular, 2 por linha), um para cada item do array "cards":
+  - título pequeno em cinza (campo "titulo");
+  - valor grande (campo "valor", formatado em pt-BR: 1.234 e 12,5);
+  - se houver "variacao_pct": seta e percentual + o texto de "comparacao" em cinza. Cores da variação:
+      chave "rastreamento": subir = verde, cair = vermelho;
+      chaves "mes" e "semana": seta e texto em cinza neutro (subir ou cair não é bom nem ruim por si só);
+  - se houver "complemento" (cartão de previsão), mostrar em cinza abaixo do valor.
+- Os cartões não devem ter gráficos, ícones grandes ou cores de fundo fortes: fundo branco, borda suave.
+
+=== 2. SEÇÃO "O QUE PRECISA DE ATENÇÃO" (logo abaixo do resumo) ===
+Usar o array "insights" (já vem ordenado por importância).
+- Título da seção + um contador discreto: "{alertas_ativos} ponto(s) de atenção".
+- Mostrar os 3 primeiros insights como cartões lado a lado (no celular, empilhados). Cada cartão:
+  - faixa colorida fina à esquerda e um ícone pequeno conforme "severidade":
+      alerta = vermelho (#d03b3b) com ícone de alerta, rótulo "Alerta";
+      atencao = âmbar (#c98500) com ícone de atenção, rótulo "Atenção";
+      positivo = verde (#1a8754) com ícone de check, rótulo "Positivo";
+      info = azul (#2a78d6) com ícone de informação, rótulo "Informação";
+    (sempre ícone + rótulo escrito, nunca só a cor);
+  - etiqueta "Novo" pequena quando "novo" = true;
+  - "titulo" em negrito;
+  - "descricao" em texto normal (no máximo 3 linhas; se for maior, cortar com "ver mais");
+  - bloco "O que fazer:" com o texto de "acao", em destaque leve (fundo cinza bem claro);
+  - rodapé em cinza bem pequeno: "Desde {desde em dd/mm/aaaa}".
+- Se houver mais de 3 insights, um botão discreto "Ver todos os insights ({total})" que expande os demais na mesma lista, no mesmo formato (e "Mostrar menos" para recolher).
+- Se o array vier vazio: mostrar uma linha simples "Nenhum ponto de atenção identificado na última carga."
+- Tooltip opcional no ícone de informação ao lado do título da seção: "Insights gerados por regras automáticas a cada nova carga de dados. Quando os dados não mudam, o insight é mantido."
+
+=== 3. RESTO DA PÁGINA ===
+- Depois dessas duas seções, manter a linha de filtros, os cartões de indicadores, os gráficos e a seção Perfis de demanda que já existem, sem alterações de conteúdo.
+- Para não repetir informação no topo, colocar os cartões de indicadores antigos (Total de exames, Média diária, % Feminino etc.) sob um subtítulo "Indicadores do período filtrado".
+- Após uma carga concluída na página "Carga de dados", ao voltar para o Painel, recarregar fn_resumo_executivo para exibir os insights atualizados.

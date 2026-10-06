@@ -1,0 +1,349 @@
+Aplique a migração SQL abaixo no banco do Lovable Cloud EXATAMENTE como está escrita, sem alterar nomes, tipos, políticas ou funções, e sem criar ou alterar telas neste passo. Ela é uma ATUALIZAÇÃO das migrações já aplicadas (arquivo 08_insights.sql): cria a tabela de insights, o motor de regras que gera os insights a cada carga, a função fn_resumo_executivo (resumo do topo do painel) e atualiza fn_pos_carga para recalcular previsão, perfis e insights ao final de cada carga. No fim, ela já gera os insights para os dados carregados. Depois de aplicar, apenas confirme que foi executada sem erros.
+
+```sql
+-- =====================================================================
+-- 08_insights.sql
+-- Resumo executivo + motor de insights acionáveis (regras determinísticas).
+--
+-- Os insights NÃO são gerados por IA: cada um é uma regra de negócio
+-- (RN-16 a RN-23) calculada no banco a cada carga. Cada insight tem uma
+-- ASSINATURA (período de referência + valores arredondados em faixas).
+-- Se uma nova carga não altera a assinatura, o insight é mantido como está
+-- (mesmo texto, mesma data); se altera, o texto é atualizado e marcado
+-- como "novo"; se a condição deixa de existir, o insight é encerrado.
+--
+--   RN-16 Tendência: média das 4 últimas semanas completas vs 8 anteriores (±20%)
+--   RN-17 Previsão: volume esperado nas próximas 4 semanas e capacidade de pico
+--   RN-18 Sazonalidade: mês seguinte ao de referência com índice ≥ 1,20 ou ≤ 0,80
+--   RN-19 Rastreamento oncológico: últimos 3 meses completos vs 3 anteriores (±20%)
+--   RN-20 Pré-natal: últimos 3 meses completos vs 3 anteriores (±20%)
+--   RN-21 Demanda espontânea: % dos últimos 3 meses vs 12 anteriores (±5 p.p.)
+--   RN-22 Saúde do homem: homens < 25% dos exames de adultos (20–59) em 12 meses
+--   RN-23 Categoria em destaque: maior mudança de participação (≥ 4 p.p.)
+--         nos últimos 3 meses vs 12 anteriores
+-- =====================================================================
+
+create table if not exists public.insight (
+  id_unidade      integer  not null references public.dim_unidade,
+  codigo          text     not null,          -- RN-16 ... RN-23 (+ sentido)
+  severidade      text     not null check (severidade in ('alerta','atencao','positivo','info')),
+  prioridade      numeric  not null,          -- maior = mais importante
+  titulo          text     not null,
+  descricao       text     not null,          -- o que aconteceu (com números)
+  acao            text     not null,          -- o que o gestor deve fazer
+  evidencia       jsonb    not null,          -- valores que sustentam o insight
+  assinatura      text     not null,          -- muda só quando o insight muda
+  ativo           boolean  not null default true,
+  criado_em       timestamptz not null default now(),
+  atualizado_em   timestamptz not null default now(),
+  id_carga        bigint,                     -- carga que criou/alterou o insight
+  primary key (id_unidade, codigo)
+);
+alter table public.insight enable row level security;
+revoke all on public.insight from anon, authenticated;
+grant select on public.insight to authenticated;
+drop policy if exists leitura_autenticada on public.insight;
+create policy leitura_autenticada on public.insight for select to authenticated using (auth.uid() is not null);
+
+-- Formatação numérica em pt-BR (ex.: 1.234 / 12,5)
+create or replace function public.fn_fmt(p numeric, p_dec int default 0)
+returns text language sql immutable as $$
+  select replace(replace(replace(to_char(round(p, p_dec),
+           'FM999G999G990' || case when p_dec > 0 then 'D' || repeat('0', p_dec) else '' end),
+         ',', '#'), '.', ','), '#', '.')
+$$;
+
+create or replace function public.fn_nome_mes(p_mes int)
+returns text language sql immutable as $$
+  select (array['janeiro','fevereiro','março','abril','maio','junho','julho','agosto',
+                'setembro','outubro','novembro','dezembro'])[p_mes]
+$$;
+
+-- ---------------------------------------------------------------------
+-- Motor de insights
+-- ---------------------------------------------------------------------
+create or replace function public.fn_gerar_insights(p_id_unidade integer)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_carga   bigint;
+  cob_ini   date; cob_fim date;
+  m_ref     date;                       -- 1º dia do último mês completo
+  w_ult     date;                       -- início da última semana completa
+  a numeric; b numeric; v numeric; x numeric; y numeric;
+  r record;
+  n_novos int := 0; n_mantidos int := 0; n_encerrados int := 0;
+begin
+  select id_carga into v_carga from log_carga
+   where id_unidade = p_id_unidade and status = 'concluida' order by finalizado_em desc limit 1;
+
+  select date_trunc('month', min(t.data))::date, max(t.data) into cob_ini, cob_fim
+    from fato_exame f join dim_tempo t using (id_data) where f.id_unidade = p_id_unidade;
+  if cob_fim is null then return jsonb_build_object('status','sem_dados'); end if;
+
+  -- último mês completo (RN-12) e última semana completa
+  m_ref := case when (date_trunc('month', cob_fim) + interval '1 month - 1 day')::date <= cob_fim
+                then date_trunc('month', cob_fim)::date
+                else (date_trunc('month', cob_fim) - interval '1 month')::date end;
+  w_ult := (cob_fim - ((extract(dow from cob_fim)::int + 1) % 7) - 6)::date;
+
+  create temp table if not exists tmp_ins (codigo text primary key, severidade text, prioridade numeric,
+    titulo text, descricao text, acao text, evidencia jsonb, assinatura text) on commit drop;
+  delete from tmp_ins;
+
+  -- base mensal da unidade (somente meses completos até m_ref)
+  create temp table if not exists tmp_mes on commit drop as
+    select null::date mes, 0::bigint n, 0::bigint rastreio, 0::bigint pre_natal, 0::bigint espont where false;
+  delete from tmp_mes;
+  insert into tmp_mes
+  select date_trunc('month', t.data)::date, count(*),
+         count(*) filter (where e.flag_rastreamento), count(*) filter (where e.flag_pre_natal),
+         count(*) filter (where a2.tipo_demanda = 'Espontânea')
+    from fato_exame f join dim_tempo t using (id_data) join dim_exame e using (id_exame)
+    join dim_atendimento a2 using (id_atendimento)
+   where f.id_unidade = p_id_unidade and t.data >= cob_ini and t.data < m_ref + interval '1 month'
+   group by 1;
+
+  -- ===== RN-16 Tendência semanal =====
+  select avg(total) filter (where inicio_semana > w_ult - 28),
+         avg(total) filter (where inicio_semana <= w_ult - 28 and inicio_semana > w_ult - 84)
+    into a, b from fn_serie_semanal(p_id_unidade);
+  if b > 0 and abs(a / b - 1) >= 0.20 then
+    v := round(100 * (a / b - 1));
+    insert into tmp_ins values (
+      case when v > 0 then 'RN-16-alta' else 'RN-16-queda' end, 'atencao', 50 + least(abs(v), 100) / 4,
+      case when v > 0 then 'Demanda de exames em alta' else 'Demanda de exames em queda' end,
+      format('Nas últimas 4 semanas, a média foi de %s exames por semana, %s%% %s das 8 semanas anteriores (%s).',
+             fn_fmt(a), fn_fmt(abs(v)), case when v > 0 then 'acima' else 'abaixo' end, fn_fmt(b)),
+      case when v > 0 then 'Reforce a coleta e confira o estoque de reagentes e testes rápidos para as próximas semanas.'
+           else 'Verifique se houve falta de insumos, coleta suspensa ou atraso no registro no e-SUS; se a oferta estiver normal, avalie busca ativa.' end,
+      jsonb_build_object('media_4_semanas', round(a,1), 'media_8_anteriores', round(b,1), 'variacao_pct', v, 'ate_semana', w_ult),
+      concat_ws('|', w_ult, sign(v), round(v / 10)));
+  end if;
+
+  -- ===== RN-17 Previsão (sempre que houver modelo) =====
+  select avg(previsto) filter (where horizonte <= 4), max(limite_sup) filter (where horizonte <= 4)
+    into a, b from previsao_semanal where id_unidade = p_id_unidade;
+  if a is not null then
+    insert into tmp_ins values ('RN-17', 'info', 30,
+      'O que esperar nas próximas 4 semanas',
+      format('A previsão é de cerca de %s exames por semana (%s por mês). Em semanas de pico, o volume pode chegar a %s.',
+             fn_fmt(a), fn_fmt(a * 4.3), fn_fmt(b)),
+      format('Planeje coleta, agenda e insumos para cerca de %s exames por semana e mantenha folga para até %s.',
+             fn_fmt(round(a / 5) * 5), fn_fmt(round(b / 5) * 5)),
+      jsonb_build_object('previsto_semana', round(a,1), 'limite_superior', round(b,1)),
+      concat_ws('|', round(a / 10), round(b / 20)));
+  end if;
+
+  -- ===== RN-18 Sazonalidade do mês seguinte =====
+  select avg(n) into y from tmp_mes;
+  select avg(n), count(*) into x, v from tmp_mes where extract(month from mes) = extract(month from m_ref + interval '1 month');
+  if y > 0 and x is not null and (x / y >= 1.20 or x / y <= 0.80) then
+    insert into tmp_ins values (
+      case when x / y >= 1.20 then 'RN-18-pico' else 'RN-18-baixa' end,
+      case when x / y >= 1.20 then 'atencao' else 'info' end,
+      case when x / y >= 1.20 then 45 else 25 end,
+      case when x / y >= 1.20 then format('Pico de demanda costuma ocorrer em %s', fn_nome_mes(extract(month from m_ref + interval '1 month')::int))
+           else format('%s costuma ter demanda baixa', initcap(fn_nome_mes(extract(month from m_ref + interval '1 month')::int))) end,
+      format('Historicamente, %s registra %s%% %s da média mensal (%s exames, com base em %s).',
+             fn_nome_mes(extract(month from m_ref + interval '1 month')::int), fn_fmt(abs(round(100 * (x / y - 1)))),
+             case when x / y >= 1.20 then 'acima' else 'abaixo' end, fn_fmt(x),
+             case when v = 1 then '1 ano de dados; confirme com novos anos' else v || ' anos de dados' end),
+      case when x / y >= 1.20 then 'Antecipe a programação: amplie vagas de coleta e garanta insumos antes do início do mês.'
+           else 'Aproveite o período para busca ativa de exames em atraso (preventivo, crônicos e pré-natal).' end,
+      jsonb_build_object('mes', extract(month from m_ref + interval '1 month'), 'indice', round(x / y, 2), 'anos', v),
+      concat_ws('|', extract(month from m_ref + interval '1 month'), round(x / y * 10)));
+  end if;
+
+  -- ===== RN-19 Rastreamento e RN-20 Pré-natal (3 meses vs 3 anteriores) =====
+  for r in select * from (values
+      ('RN-19', 'rastreio', 'exames de rastreamento de câncer de colo e mama', 'Rastreamento de câncer',
+       'Faça busca ativa de mulheres de 25 a 64 anos com preventivo em atraso e de 50 a 69 anos sem mamografia; confira a agenda de coleta.',
+       'Mantenha a estratégia atual de rastreamento e acompanhe a entrega dos resultados.'),
+      ('RN-20', 'pre_natal', 'exames de pré-natal', 'Exames de pré-natal',
+       'Verifique a captação de gestantes no 1º trimestre e a oferta de testes rápidos (HIV, sífilis e hepatites) nas consultas.',
+       'Mantenha o fluxo de exames do pré-natal e confira se as gestantes estão completando os exames de cada trimestre.')
+    ) z(cod, col, nome, rotulo, acao_queda, acao_alta)
+  loop
+    execute format('select sum(%1$I) filter (where mes > $1 - interval ''3 month''),
+                           sum(%1$I) filter (where mes <= $1 - interval ''3 month'' and mes > $1 - interval ''6 month'')
+                      from tmp_mes', r.col) into a, b using m_ref;
+    if b > 0 and abs(a / b - 1) >= 0.20 then
+      v := round(100 * (a / b - 1));
+      insert into tmp_ins values (
+        r.cod || case when v > 0 then '-alta' else '-queda' end,
+        case when v <= -40 then 'alerta' when v < 0 then 'atencao' else 'positivo' end,
+        case when v < 0 then 70 + least(abs(v), 100) / 4 else 20 end,
+        r.rotulo || case when v > 0 then ' em alta' else ' em queda' end,
+        format('Nos últimos 3 meses foram %s %s, %s%% %s que nos 3 meses anteriores (%s).',
+               fn_fmt(a), r.nome, fn_fmt(abs(v)), case when v > 0 then 'a mais' else 'a menos' end, fn_fmt(b)),
+        case when v < 0 then r.acao_queda else r.acao_alta end,
+        jsonb_build_object('ultimos_3_meses', a, 'tres_meses_anteriores', b, 'variacao_pct', v, 'mes_referencia', m_ref),
+        concat_ws('|', m_ref, sign(v), round(v / 10)));
+    end if;
+  end loop;
+
+  -- ===== RN-21 Demanda espontânea =====
+  select 100.0 * sum(espont) filter (where mes > m_ref - interval '3 month') / nullif(sum(n) filter (where mes > m_ref - interval '3 month'), 0),
+         100.0 * sum(espont) filter (where mes <= m_ref - interval '3 month' and mes > m_ref - interval '15 month')
+               / nullif(sum(n) filter (where mes <= m_ref - interval '3 month' and mes > m_ref - interval '15 month'), 0)
+    into a, b from tmp_mes;
+  if a is not null and b is not null and abs(a - b) >= 5 then
+    insert into tmp_ins values (
+      case when a > b then 'RN-21-alta' else 'RN-21-queda' end,
+      case when a > b then 'atencao' else 'positivo' end, case when a > b then 55 else 15 end,
+      case when a > b then 'Mais pacientes chegando sem agendamento' else 'Demanda sem agendamento diminuiu' end,
+      format('Nos últimos 3 meses, %s%% dos exames vieram de consultas no dia, contra %s%% nos 12 meses anteriores.', fn_fmt(a, 1), fn_fmt(b, 1)),
+      case when a > b then 'Reserve vagas diárias para a demanda espontânea e revise a agenda programada (acesso avançado) para reduzir a espera.'
+           else 'A agenda programada está absorvendo mais a demanda; mantenha o acompanhamento.' end,
+      jsonb_build_object('pct_ultimos_3_meses', round(a,1), 'pct_12_meses_anteriores', round(b,1), 'mes_referencia', m_ref),
+      concat_ws('|', m_ref, sign(a - b), round((a - b) / 5)));
+  end if;
+
+  -- ===== RN-22 Saúde do homem (adultos de 20 a 59 anos, últimos 12 meses) =====
+  select 100.0 * count(*) filter (where x2.descricao = 'Masculino') / nullif(count(*), 0) into a
+    from fato_exame f join dim_tempo t using (id_data) join dim_sexo x2 using (id_sexo) join dim_faixa_etaria fx using (id_faixa)
+   where f.id_unidade = p_id_unidade and fx.ciclo_vida like 'Adulto%' and x2.descricao in ('Feminino','Masculino')
+     and t.data >= m_ref - interval '11 month' and t.data < m_ref + interval '1 month';
+  if a < 25 then
+    insert into tmp_ins values ('RN-22', 'info', 35,
+      'Homens adultos procuram pouco a unidade',
+      format('Nos últimos 12 meses, homens de 20 a 59 anos responderam por apenas %s%% dos exames de adultos.', fn_fmt(a, 1)),
+      'Planeje ações de saúde do homem: horário estendido, mutirões de exames (glicemia, colesterol, PSA quando indicado) e convite via agentes comunitários.',
+      jsonb_build_object('pct_homens_adultos', round(a,1), 'mes_referencia', m_ref),
+      concat_ws('|', round(a / 5)));
+  end if;
+
+  -- ===== RN-23 Categoria em destaque =====
+  select c.categoria, c.d, c.p3, c.p12 into r from (
+    select e.categoria,
+           100.0 * count(*) filter (where t.data >= m_ref - interval '2 month') / nullif(sum(count(*) filter (where t.data >= m_ref - interval '2 month')) over (), 0) p3,
+           100.0 * count(*) filter (where t.data < m_ref - interval '2 month') / nullif(sum(count(*) filter (where t.data < m_ref - interval '2 month')) over (), 0) p12,
+           0::numeric d
+      from fato_exame f join dim_tempo t using (id_data) join dim_exame e using (id_exame)
+     where f.id_unidade = p_id_unidade and t.data >= m_ref - interval '14 month' and t.data < m_ref + interval '1 month'
+     group by e.categoria) c0
+   cross join lateral (select c0.categoria, c0.p3 - c0.p12 as d, c0.p3, c0.p12) c
+   where c0.categoria <> 'Outros'
+   order by abs(c0.p3 - c0.p12) desc limit 1;
+  if r.categoria is not null and abs(r.d) >= 4 then
+    insert into tmp_ins values ('RN-23', case when r.d > 0 then 'info' else 'atencao' end, case when r.d > 0 then 28 else 40 end,
+      format('%s: participação %s', r.categoria, case when r.d > 0 then 'em alta' else 'em queda' end),
+      format('Nos últimos 3 meses, %s representou %s%% dos exames, contra %s%% nos 12 meses anteriores.', r.categoria, fn_fmt(r.p3, 1), fn_fmt(r.p12, 1)),
+      case when r.d > 0 then format('Garanta reagentes e capacidade de coleta para exames de %s.', lower(r.categoria))
+           else format('Verifique se houve falta de insumos ou mudança nos protocolos de solicitação de %s.', lower(r.categoria)) end,
+      jsonb_build_object('categoria', r.categoria, 'pct_3_meses', round(r.p3,1), 'pct_12_meses', round(r.p12,1), 'mes_referencia', m_ref),
+      concat_ws('|', r.categoria, m_ref, sign(r.d), round(r.d / 2)));
+  end if;
+
+  -- ===== Consolidação: manter, atualizar ou encerrar =====
+  select count(*) into n_mantidos from insight i join tmp_ins t using (codigo)
+   where i.id_unidade = p_id_unidade and i.ativo and i.assinatura = t.assinatura;
+
+  insert into insight (id_unidade, codigo, severidade, prioridade, titulo, descricao, acao, evidencia, assinatura, ativo, id_carga)
+  select p_id_unidade, t.codigo, t.severidade, t.prioridade, t.titulo, t.descricao, t.acao, t.evidencia, t.assinatura, true, v_carga
+    from tmp_ins t
+  on conflict (id_unidade, codigo) do update
+     set severidade = excluded.severidade, prioridade = excluded.prioridade, titulo = excluded.titulo,
+         descricao = excluded.descricao, acao = excluded.acao, evidencia = excluded.evidencia,
+         assinatura = excluded.assinatura, ativo = true, atualizado_em = now(), id_carga = excluded.id_carga,
+         criado_em = case when insight.ativo then insight.criado_em else now() end
+   where insight.assinatura is distinct from excluded.assinatura or not insight.ativo;
+  get diagnostics n_novos = row_count;
+
+  update insight set ativo = false, atualizado_em = now(), id_carga = v_carga
+   where id_unidade = p_id_unidade and ativo and codigo not in (select codigo from tmp_ins);
+  get diagnostics n_encerrados = row_count;
+
+  return jsonb_build_object('status','ok','novos_ou_alterados',n_novos,'mantidos',n_mantidos,'encerrados',n_encerrados);
+end $$;
+
+-- ---------------------------------------------------------------------
+-- Resumo executivo (topo do painel) + insights ativos
+-- ---------------------------------------------------------------------
+create or replace function public.fn_resumo_executivo(p_id_unidade integer default null)
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+declare
+  u int; cob_fim date; m_ref date; ult record;
+  tot numeric; ant numeric; yoy numeric; s4 numeric; prev numeric; pico numeric;
+  r3 numeric; r3a numeric; frase text; mes_txt text;
+begin
+  if auth.uid() is null then raise exception 'Acesso negado.'; end if;
+  u := coalesce(p_id_unidade, (select min(id_unidade) from fato_exame));
+  select max(t.data) into cob_fim from fato_exame f join dim_tempo t using (id_data) where f.id_unidade = u;
+  if cob_fim is null then return jsonb_build_object('status','sem_dados'); end if;
+  m_ref := case when (date_trunc('month', cob_fim) + interval '1 month - 1 day')::date <= cob_fim
+                then date_trunc('month', cob_fim)::date else (date_trunc('month', cob_fim) - interval '1 month')::date end;
+  select * into ult from log_carga where id_unidade = u and status = 'concluida' order by finalizado_em desc limit 1;
+
+  select count(*) filter (where t.data >= m_ref and t.data < m_ref + interval '1 month'),
+         count(*) filter (where t.data >= m_ref - interval '1 month' and t.data < m_ref),
+         count(*) filter (where t.data >= m_ref - interval '12 month' and t.data < m_ref - interval '11 month'),
+         count(*) filter (where e.flag_rastreamento and t.data >= m_ref - interval '2 month' and t.data < m_ref + interval '1 month'),
+         count(*) filter (where e.flag_rastreamento and t.data >= m_ref - interval '5 month' and t.data < m_ref - interval '2 month')
+    into tot, ant, yoy, r3, r3a
+    from fato_exame f join dim_tempo t using (id_data) join dim_exame e using (id_exame) where f.id_unidade = u;
+  if yoy = 0 or (select min(t.data) from fato_exame f join dim_tempo t using (id_data) where f.id_unidade = u) > m_ref - interval '12 month' then yoy := null; end if;
+
+  select avg(total) into s4 from (select total from fn_serie_semanal(u) order by inicio_semana desc limit 4) z;
+  select avg(previsto) filter (where horizonte <= 4), max(limite_sup) filter (where horizonte <= 4) into prev, pico
+    from previsao_semanal where id_unidade = u;
+
+  mes_txt := fn_nome_mes(extract(month from m_ref)::int) || '/' || extract(year from m_ref);
+  frase := format('Em %s, a unidade registrou %s exames (%s em relação ao mês anterior%s).',
+                  mes_txt, fn_fmt(tot),
+                  case when ant > 0 then (case when tot >= ant then '+' else '−' end) || fn_fmt(abs(round(100 * (tot / ant - 1)))) || '%' else 'sem comparação' end,
+                  case when yoy > 0 then '; ' || (case when tot >= yoy then '+' else '−' end) || fn_fmt(abs(round(100 * (tot / yoy - 1)))) || '% frente ao mesmo mês do ano anterior' else '' end)
+           || case when prev is not null then format(' Para as próximas 4 semanas, a previsão é de cerca de %s exames por semana.', fn_fmt(prev)) else '' end;
+
+  return jsonb_build_object(
+    'id_unidade', u,
+    'dados_ate', cob_fim,
+    'dias_desde_ultimo_dado', current_date - cob_fim,
+    'ultima_carga', ult.finalizado_em,
+    'mes_referencia', to_char(m_ref, 'YYYY-MM'),
+    'mes_referencia_texto', mes_txt,
+    'frase', frase,
+    'cards', jsonb_build_array(
+      jsonb_build_object('chave','mes','titulo','Exames em ' || mes_txt, 'valor', tot,
+                         'variacao_pct', case when ant > 0 then round(100 * (tot / ant - 1), 1) end, 'comparacao','vs mês anterior'),
+      jsonb_build_object('chave','semana','titulo','Média semanal (últimas 4 semanas)', 'valor', round(s4, 1),
+                         'variacao_pct', case when prev > 0 then round(100 * (s4 / prev - 1), 1) end, 'comparacao','vs previsão atual'),
+      jsonb_build_object('chave','previsao','titulo','Previsão por semana (próximas 4)', 'valor', round(prev, 0),
+                         'complemento', case when pico is not null then 'pico de até ' || fn_fmt(pico) end),
+      jsonb_build_object('chave','rastreamento','titulo','Rastreamento (últimos 3 meses)', 'valor', r3,
+                         'variacao_pct', case when r3a > 0 then round(100 * (r3 / r3a - 1), 1) end, 'comparacao','vs 3 meses anteriores')),
+    'alertas_ativos', (select count(*) from insight where id_unidade = u and ativo and severidade in ('alerta','atencao')),
+    'insights', (select coalesce(jsonb_agg(jsonb_build_object(
+                    'codigo', codigo, 'severidade', severidade, 'titulo', titulo, 'descricao', descricao,
+                    'acao', acao, 'evidencia', evidencia, 'desde', criado_em, 'atualizado_em', atualizado_em,
+                    'novo', (id_carga = ult.id_carga and atualizado_em >= ult.iniciado_em))
+                  order by case severidade when 'alerta' then 4 when 'atencao' then 3 when 'positivo' then 2 else 1 end desc,
+                           prioridade desc), '[]')
+                  from insight where id_unidade = u and ativo)
+  );
+end $$;
+
+-- Encadeia previsão, perfis e insights ao final de cada carga
+create or replace function public.fn_pos_carga(p_id_unidade integer)
+returns jsonb language plpgsql security definer set search_path = public as $$
+begin
+  return jsonb_build_object('previsao', fn_gerar_previsao(p_id_unidade),
+                            'perfis',   fn_gerar_perfis(p_id_unidade),
+                            'insights', fn_gerar_insights(p_id_unidade));
+end $$;
+
+do $$
+declare f text;
+begin
+  foreach f in array array['fn_gerar_insights(integer)','fn_resumo_executivo(integer)','fn_pos_carga(integer)']
+  loop
+    execute format('revoke all on function public.%s from public, anon', f);
+    execute format('grant execute on function public.%s to authenticated', f);
+  end loop;
+end $$;
+
+-- Gera os insights para os dados já carregados
+select public.fn_gerar_insights(u.id_unidade)
+  from public.dim_unidade u
+ where exists (select 1 from public.fato_exame f where f.id_unidade = u.id_unidade);
+```

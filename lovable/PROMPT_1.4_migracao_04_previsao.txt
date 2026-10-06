@@ -1,0 +1,113 @@
+Aplique a migração SQL abaixo no banco do Lovable Cloud EXATAMENTE como está escrita, sem alterar nomes, tipos, políticas ou funções, e sem criar telas ainda. Ela é a parte 4 de 6 do backend do projeto (arquivo 04_previsao.sql). Depois de aplicar, apenas confirme que foi executada sem erros.
+
+```sql
+-- =====================================================================
+-- 04_previsao.sql
+-- Modelo preditivo: Suavização Exponencial Simples (SES / ETS(A,N,N)),
+-- selecionado na etapa de validação em Python (menor MAE e MAPE no
+-- conjunto de teste das últimas 8 semanas).
+--
+--   Nível:     l_t = alpha * y_t + (1 - alpha) * l_{t-1},   l_1 = y_1
+--   Previsão:  ŷ_{T+h} = l_T                    (h = 1..8 semanas)
+--   Intervalo de 95%:
+--              ŷ ± 1,96 * sigma * sqrt(1 + (h - 1) * alpha²)
+--   (variância de previsão do ETS(A,N,N); Hyndman e Athanasopoulos, 2021)
+--
+--   alpha é escolhido por busca em grade (0,05 a 0,95; passo 0,01),
+--   minimizando a soma dos quadrados dos erros de previsão 1 passo à frente.
+--   O modelo é RETREINADO automaticamente a cada carga concluída.
+-- =====================================================================
+
+-- Série semanal completa da unidade (RN-12: apenas semanas inteiras).
+create or replace function public.fn_serie_semanal(p_id_unidade integer)
+returns table (inicio_semana date, total integer)
+language sql stable security definer set search_path = public as $$
+  with cob as (
+    select min(t.data) as dmin, max(t.data) as dmax
+      from fato_exame f join dim_tempo t using (id_data)
+     where f.id_unidade = p_id_unidade
+  ), lim as (
+    -- 1º domingo dentro da cobertura e último domingo cuja semana fecha
+    select (dmin + ((7 - extract(dow from dmin)::int) % 7))::date as ini,
+           (dmax - ((extract(dow from dmax)::int + 1) % 7) - 6)::date as fim
+      from cob
+  )
+  select g::date, coalesce(s.n, 0)::int
+    from lim
+    cross join generate_series(lim.ini, lim.fim, interval '7 day') g
+    left join (select t.inicio_semana, count(*) n
+                 from fato_exame f join dim_tempo t using (id_data)
+                where f.id_unidade = p_id_unidade
+                group by 1) s on s.inicio_semana = g::date
+   order by 1
+$$;
+
+create or replace function public.fn_gerar_previsao(p_id_unidade integer, p_horizonte integer default 8)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  y        numeric[];
+  semanas  date[];
+  n        integer;
+  a        numeric;
+  best_a   numeric;
+  best_sse numeric := null;
+  sse      numeric;
+  sae      numeric;
+  best_sae numeric;
+  lvl      numeric;
+  e        numeric;
+  sigma    numeric;
+  h        integer;
+  z        constant numeric := 1.96;
+begin
+  select array_agg(total::numeric order by inicio_semana), array_agg(inicio_semana order by inicio_semana)
+    into y, semanas
+    from fn_serie_semanal(p_id_unidade);
+  n := coalesce(array_length(y, 1), 0);
+
+  delete from previsao_semanal  where id_unidade = p_id_unidade;
+  delete from previsao_metricas where id_unidade = p_id_unidade;
+
+  -- RN-13 | Mínimo de 12 semanas completas para gerar previsão.
+  if n < 12 then
+    return jsonb_build_object('status','sem_previsao','motivo','menos de 12 semanas completas','semanas',n);
+  end if;
+
+  -- Busca em grade de alpha
+  a := 0.05;
+  while a <= 0.951 loop
+    lvl := y[1]; sse := 0; sae := 0;
+    for t in 2..n loop
+      e   := y[t] - lvl;              -- erro 1 passo à frente
+      sse := sse + e * e;
+      sae := sae + abs(e);
+      lvl := a * y[t] + (1 - a) * lvl;
+    end loop;
+    if best_sse is null or sse < best_sse then
+      best_sse := sse; best_a := a; best_sae := sae;
+    end if;
+    a := a + 0.01;
+  end loop;
+
+  -- Nível final com o alpha ótimo
+  lvl := y[1];
+  for t in 2..n loop
+    lvl := best_a * y[t] + (1 - best_a) * lvl;
+  end loop;
+  sigma := sqrt(best_sse / (n - 1));
+
+  for h in 1..p_horizonte loop
+    insert into previsao_semanal (id_unidade, inicio_semana, horizonte, previsto, limite_inf, limite_sup, modelo)
+    values (p_id_unidade, semanas[n] + 7 * h, h, round(lvl, 1),
+            round(greatest(0, lvl - z * sigma * sqrt(1 + (h - 1) * best_a ^ 2)), 1),
+            round(lvl + z * sigma * sqrt(1 + (h - 1) * best_a ^ 2), 1),
+            'SES (ETS A,N,N)');
+  end loop;
+
+  insert into previsao_metricas (id_unidade, modelo, alpha, sigma, mae_treino, semanas_treino, ultima_semana)
+  values (p_id_unidade, 'SES (ETS A,N,N)', best_a, round(sigma, 2), round(best_sae / (n - 1), 2), n, semanas[n]);
+
+  return jsonb_build_object('status','ok','alpha',best_a,'nivel',round(lvl,1),
+                            'sigma',round(sigma,2),'semanas',n);
+end $$;
+```
